@@ -206,6 +206,8 @@ int start_answerphone(const char* sip_user, const char* sip_domain)
 {
     pj_status_t status;
     signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
     if (init_answerphone() != PJ_SUCCESS)
     {
         return -1;
