@@ -9,6 +9,7 @@ static pj_timer_heap_t* t_heap;
 static pjsua_acc_id acc_id;
 
 static pjsua_config cfg;
+static pjsua_media_config med_cfg;
 static pjsua_logging_config log_cfg;
 static pjsua_transport_config t_cfg;
 static pjsua_acc_config acc_cfg;
@@ -59,7 +60,7 @@ static void on_incoming_call(pjsua_acc_id acc_id, pjsua_call_id call_id, pjsip_r
     pjsua_call_answer(call_id, 180, NULL, NULL);
 
     pj_timer_entry timer;
-    pj_time_val delay = {6, 100};
+    pj_time_val delay = {3, 100};
     pj_timer_entry_init(&timer, PJSUA_INVALID_ID, NULL, &timer_callback);
 
     status = pj_timer_heap_schedule(t_heap, &timer, &delay);
@@ -72,6 +73,74 @@ static void on_incoming_call(pjsua_acc_id acc_id, pjsua_call_id call_id, pjsip_r
     while (pj_timer_entry_running(&timer)) {}
 
     pjsua_call_answer(call_id, 200, NULL, NULL);
+}
+
+static void on_call_media_state (pjsua_call_id call_id)
+{
+    pj_status_t status;
+    char temp[16];
+    snprintf(temp, 16, "%dpl", call_id);
+
+    pj_pool_t* media_pool = pj_pool_create(&ch_pool.factory, temp, MEDIA_POOL_SIZE, MEDIA_POOL_INC_SIZE, NULL);
+    if (!media_pool)
+    {
+        PJ_LOG(1, (__FILE__, "==pj_pool_create error=="));
+        pjsua_call_hangup(call_id, 486, NULL, NULL);
+        return;
+    }
+
+    pjmedia_port* tone_port = pj_pool_alloc(media_pool, sizeof(pjmedia_port));
+    status = pjmedia_tonegen_create(media_pool, PJSUA_DEFAULT_CLOCK_RATE, 1, PJSUA_CALL_SEND_DTMF_DURATION_DEFAULT, 16, 0, &tone_port);
+    if (status != PJ_SUCCESS)
+    {
+        PJ_LOG(1, (__FILE__, "==pjmedia_tonegen_create error=="));
+        pj_pool_release(media_pool);
+        pjsua_call_hangup(call_id, 486, NULL, NULL);
+        return;
+    }
+
+    // pjsua_conf_port_id conf_slot;
+    // status = pjsua_conf_add_port(media_pool, tone_port, &conf_slot);
+    // if (status != PJ_SUCCESS)
+    // {
+    //     PJ_LOG(1, (__FILE__, "==pjsua_conf_add_port error=="));
+    //     pj_pool_release(media_pool);
+    //     pjsua_call_hangup(call_id, 486, NULL, NULL);
+    //     return;
+    // }
+
+    // status = pjsua_conf_connect(conf_slot, 0);
+    // if (status != PJ_SUCCESS)
+    // {
+    //     PJ_LOG(1, (__FILE__, "==pjsua_conf_connect error=="));
+    //     pjsua_conf_remove_port(conf_slot);
+    //     pj_pool_release(media_pool);
+    //     pjsua_call_hangup(call_id, 486, NULL, NULL);
+    //     return;
+    // }
+
+    pjmedia_tone_desc tone;
+    tone.freq1 = 425;
+    tone.freq2 = 0;
+    tone.off_msec = 0;
+    tone.on_msec = 1000;
+
+    pj_timer_entry timer;
+    pj_time_val delay = {1, 0};
+    pj_timer_entry_init(&timer, PJSUA_INVALID_ID, NULL, &timer_callback);
+
+    status = pj_timer_heap_schedule(t_heap, &timer, &delay);
+    while (status == PJ_SUCCESS)
+    {
+        status = pjmedia_tonegen_play(tone_port, 1, &tone, PJMEDIA_TONEGEN_LOOP);
+        while (pj_timer_entry_running(&timer)){}
+        status = pj_timer_heap_schedule(t_heap, &timer, &delay);
+    }
+
+    //pjsua_conf_disconnect(conf_slot, 0);
+    //pjsua_conf_remove_port(conf_slot);
+    pj_pool_release(media_pool);
+    pjsua_call_hangup(call_id, 486, NULL, NULL);
 }
 
 int init_answerphone()
@@ -87,12 +156,15 @@ int init_answerphone()
 
     pjsua_config_default(&cfg);
     cfg.cb.on_incoming_call = &on_incoming_call;
+    cfg.cb.on_call_media_state = &on_call_media_state;
+
+    pjsua_media_config_default(&med_cfg);
 
     pjsua_logging_config_default(&log_cfg);
     log_cfg.msg_logging = PJ_TRUE;
     log_cfg.console_level = 4;
 
-    status = pjsua_init(&cfg, &log_cfg, NULL);
+    status = pjsua_init(&cfg, &log_cfg, &med_cfg);
     if (status != PJ_SUCCESS)
     {
         printf("pjsua_init error\n");
@@ -134,12 +206,9 @@ static int create_transport()
     if (status != PJ_SUCCESS)
     {
         printf("pjsua_transport_create error\n");
-        return -1;
     }
-    else
-    {
-        return PJ_SUCCESS;
-    }
+
+    return status;
 }
 
 static int create_pools()
@@ -161,10 +230,9 @@ static int create_timer_heap()
     if (status != PJ_SUCCESS)
     {
         printf("pj_timer_heap_create error\n");
-        return -1;
     }
 
-    return PJ_SUCCESS;
+    return status;
 }
 
 static int add_account(const char* sip_user, const char* sip_domain)
@@ -198,8 +266,9 @@ static int add_account(const char* sip_user, const char* sip_domain)
     if (status != PJ_SUCCESS)
     {
         printf("pjsua_acc_add error\n");
-        return -1;
     }
+
+    return status;
 }
 
 int start_answerphone(const char* sip_user, const char* sip_domain)

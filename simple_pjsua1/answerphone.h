@@ -3,6 +3,8 @@
 
 #define DEFAULT_PASSWD "passwd"
 #define MAIN_POOL_SIZE 128
+#define MEDIA_POOL_SIZE 512
+#define MEDIA_POOL_INC_SIZE 128
 #define MAX_USERNAME_LEN 32
 #define MAX_DOMAIN_LEN 64
 
