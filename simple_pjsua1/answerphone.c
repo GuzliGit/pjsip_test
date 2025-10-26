@@ -14,6 +14,7 @@ static pjsua_logging_config log_cfg;
 static pjsua_transport_config t_cfg;
 static pjsua_acc_config acc_cfg;
 
+static int send_tone(pjsua_call_id);
 static int create_transport();
 static int create_pools();
 static int create_timer_heap();
@@ -34,10 +35,22 @@ static void signal_handler()
     exit(PJ_SUCCESS);
 }
 
+static void answer_timer_callback(pj_timer_heap_t* timer_heap, pj_timer_entry* entry)
+{
+    pjsua_call_id call_id = (pjsua_call_id)(long)entry->user_data;
+
+    PJ_LOG(1, (__FILE__, "==Answer_timer_callback=="));
+    pjsua_call_answer(call_id, 200, NULL, NULL);
+    
+    if (send_tone(call_id) != PJ_SUCCESS)
+    {
+        PJ_LOG(1, (__FILE__, "pjsua_call_answer error (200)"));
+    }
+}
+
 static void timer_callback(pj_timer_heap_t* timer_heap, pj_timer_entry* entry)
 {
     PJ_LOG(1, (__FILE__, "==Timer_callback=="));
-    return;
 }
 
 static void on_incoming_call(pjsua_acc_id acc_id, pjsua_call_id call_id, pjsip_rx_data* rdata)
@@ -59,23 +72,20 @@ static void on_incoming_call(pjsua_acc_id acc_id, pjsua_call_id call_id, pjsip_r
 
     pjsua_call_answer(call_id, 180, NULL, NULL);
 
-    pj_timer_entry timer;
+    pj_timer_entry* timer = pj_pool_zalloc(main_pool, sizeof(pj_timer_entry));
     pj_time_val delay = {3, 100};
-    pj_timer_entry_init(&timer, PJSUA_INVALID_ID, NULL, &timer_callback);
+    pj_timer_entry_init(timer, PJSUA_INVALID_ID, NULL, &answer_timer_callback);
+    timer->user_data = (void*)(long)call_id;
 
-    status = pj_timer_heap_schedule(t_heap, &timer, &delay);
+    status = pj_timer_heap_schedule(t_heap, timer, &delay);
     if (status != PJ_SUCCESS)
     {
         pjsua_call_hangup(call_id, 486, NULL, NULL);
         return;
     }
-
-    while (pj_timer_entry_running(&timer)) {}
-
-    pjsua_call_answer(call_id, 200, NULL, NULL);
 }
 
-static void on_call_media_state (pjsua_call_id call_id)
+static int send_tone(pjsua_call_id call_id)
 {
     pj_status_t status;
     char temp[16];
@@ -86,7 +96,7 @@ static void on_call_media_state (pjsua_call_id call_id)
     {
         PJ_LOG(1, (__FILE__, "==pj_pool_create error=="));
         pjsua_call_hangup(call_id, 486, NULL, NULL);
-        return;
+        return -1;
     }
 
     pjmedia_port* tone_port = pj_pool_alloc(media_pool, sizeof(pjmedia_port));
@@ -96,51 +106,49 @@ static void on_call_media_state (pjsua_call_id call_id)
         PJ_LOG(1, (__FILE__, "==pjmedia_tonegen_create error=="));
         pj_pool_release(media_pool);
         pjsua_call_hangup(call_id, 486, NULL, NULL);
-        return;
+        return -1;
     }
 
-    // pjsua_conf_port_id conf_slot;
-    // status = pjsua_conf_add_port(media_pool, tone_port, &conf_slot);
-    // if (status != PJ_SUCCESS)
-    // {
-    //     PJ_LOG(1, (__FILE__, "==pjsua_conf_add_port error=="));
-    //     pj_pool_release(media_pool);
-    //     pjsua_call_hangup(call_id, 486, NULL, NULL);
-    //     return;
-    // }
+    pjsua_conf_port_id conf_slot;
+    status = pjsua_conf_add_port(media_pool, tone_port, &conf_slot);
+    if (status != PJ_SUCCESS)
+    {
+        PJ_LOG(1, (__FILE__, "==pjsua_conf_add_port error=="));
+        pj_pool_release(media_pool);
+        pjsua_call_hangup(call_id, 486, NULL, NULL);
+        return -1;
+    }
 
-    // status = pjsua_conf_connect(conf_slot, 0);
-    // if (status != PJ_SUCCESS)
-    // {
-    //     PJ_LOG(1, (__FILE__, "==pjsua_conf_connect error=="));
-    //     pjsua_conf_remove_port(conf_slot);
-    //     pj_pool_release(media_pool);
-    //     pjsua_call_hangup(call_id, 486, NULL, NULL);
-    //     return;
-    // }
+    status = pjsua_set_null_snd_dev();
+
+    pjsua_call_info call_info;
+    status = pjsua_call_get_info(call_id, &call_info);
+
+    status = pjsua_conf_connect(conf_slot, call_info.conf_slot);
+    if (status != PJ_SUCCESS)
+    {
+        PJ_LOG(1, (__FILE__, "==pjsua_conf_connect error=="));
+        pjsua_conf_remove_port(conf_slot);
+        pj_pool_release(media_pool);
+        pjsua_call_hangup(call_id, 486, NULL, NULL);
+        return -1;
+    }
+    PJ_LOG(3, (__FILE__, "Tone 425Hz started for call %d, conf_slot=%d", call_id, conf_slot));
 
     pjmedia_tone_desc tone;
     tone.freq1 = 425;
     tone.freq2 = 0;
     tone.off_msec = 0;
-    tone.on_msec = 1000;
+    tone.on_msec = 10000;
 
-    pj_timer_entry timer;
-    pj_time_val delay = {1, 0};
-    pj_timer_entry_init(&timer, PJSUA_INVALID_ID, NULL, &timer_callback);
+    status = pjmedia_tonegen_play(tone_port, 1, &tone, PJMEDIA_TONEGEN_LOOP);
+    pj_thread_sleep(tone.on_msec);
 
-    status = pj_timer_heap_schedule(t_heap, &timer, &delay);
-    while (status == PJ_SUCCESS)
-    {
-        status = pjmedia_tonegen_play(tone_port, 1, &tone, PJMEDIA_TONEGEN_LOOP);
-        while (pj_timer_entry_running(&timer)){}
-        status = pj_timer_heap_schedule(t_heap, &timer, &delay);
-    }
-
-    //pjsua_conf_disconnect(conf_slot, 0);
-    //pjsua_conf_remove_port(conf_slot);
+    pjsua_conf_disconnect(conf_slot, call_info.conf_slot);
+    pjsua_conf_remove_port(conf_slot);
     pj_pool_release(media_pool);
     pjsua_call_hangup(call_id, 486, NULL, NULL);
+    return PJ_SUCCESS;
 }
 
 int init_answerphone()
@@ -156,7 +164,6 @@ int init_answerphone()
 
     pjsua_config_default(&cfg);
     cfg.cb.on_incoming_call = &on_incoming_call;
-    cfg.cb.on_call_media_state = &on_call_media_state;
 
     pjsua_media_config_default(&med_cfg);
 
