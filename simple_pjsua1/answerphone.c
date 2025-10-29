@@ -350,7 +350,7 @@ static int create_pools()
 
 static int create_timer_heap()
 {
-    pj_status_t status = pj_timer_heap_create(main_pool, 10, &t_heap);
+    pj_status_t status = pj_timer_heap_create(main_pool, PJSUA_MAX_CALLS, &t_heap);
     if (status != PJ_SUCCESS)
     {
         PJ_LOG(1, (__FILE__, "==pj_timer_heap_create error=="));
@@ -396,7 +396,8 @@ static int add_account(const char* sip_user, const char* sip_domain)
 static int observe_calls_arr()
 {
     int ready_count = 0;
-    for (int i = 0; i < PJSUA_MAX_CALLS; i++)
+    
+    for (int i = 0; i < PJSUA_MAX_CALLS; i++) 
     {
         call_ids[i] = -1;
     }
@@ -404,31 +405,28 @@ static int observe_calls_arr()
     while (1)
     {
         ready_count = 0;
-
-        while (ready_count != UPDATERS_COUNT)
+        for (int i = 0; i < UPDATERS_COUNT; i++) 
         {
-            pj_thread_sleep(1000);
-
-            ready_count = 0;
-            for (int i = 0; i < UPDATERS_COUNT; i++)
+            if (pj_atomic_get(update_counter[i]) == 0) 
             {
-                ready_count += pj_atomic_get(update_counter[i]);
+                ready_count++;
             }
         }
 
-        PJ_LOG(1, (__FILE__, "==OBSERVE_CALLS=="));
-        pjsua_call_id cur_calls[PJSUA_MAX_CALLS];
-        unsigned int cur_count;
-        pjsua_enum_calls(cur_calls, &cur_count);
-        for (int i = 0; i < cur_count; i++)
-        {
-            call_ids[cur_calls[i] % PJSUA_MAX_CALLS] = cur_calls[i]; 
+        if (ready_count == UPDATERS_COUNT) {
+            unsigned int cur_count = PJSUA_MAX_CALLS;
+            pj_status_t status = pjsua_enum_calls(call_ids, &cur_count);
+            
+            if (status == PJ_SUCCESS)
+            {
+                for (int i = 0; i < UPDATERS_COUNT; i++) 
+                {
+                    pj_atomic_set(update_counter[i], 1);
+                }
+            }
         }
-
-        for (int i = 0; i < UPDATERS_COUNT; i++)
-        {
-            pj_atomic_dec(update_counter[i]);
-        }
+        
+        pj_thread_sleep(1000);
     }
 
     return 0;
@@ -436,35 +434,58 @@ static int observe_calls_arr()
 
 static int update_calls_status(void* data)
 {
-    int* tid = (int*)data;
+    int tid = *(int*)data;
     int chunk = PJSUA_MAX_CALLS / UPDATERS_COUNT;
-    int l_br = *tid * chunk;
-    int u_br = *tid == (UPDATERS_COUNT - 1) ? PJSUA_MAX_CALLS : l_br + chunk;
-    pj_status_t status;
-    pjsua_call_info call_info;
+    int l_br = tid * chunk;
+    int u_br = (tid == (UPDATERS_COUNT - 1)) ? PJSUA_MAX_CALLS : l_br + chunk;
+    
+    PJ_LOG(1, (__FILE__, "==UPDATER %d started: range %d-%d==", tid, l_br, u_br));
 
     while (1)
     {
-        while (pj_atomic_get(update_counter[*tid]) == 1)
+        while (pj_atomic_get(update_counter[tid]) == 0) 
         {
-            pj_thread_sleep(1000);
+            pj_thread_sleep(100);
         }
         
-        PJ_LOG(1, (__FILE__, "==UPDATE_CALLS=="));
-        for (int i = l_br; i < u_br; i++)
+        int ready = 0;
+        for (int i = l_br; i < u_br; i++) 
         {
-            if (call_ids[i] == -1)
+            pjsua_call_id call_id = call_ids[i];
+            
+            if (call_id == -1) 
                 continue;
-
-            status = pjsua_call_get_info(call_ids[i], &call_info);
-            if (status != PJ_SUCCESS || ((call_info.total_duration.sec - call_info.connect_duration.sec) >= MAX_ANSWER_DURATION_SEC))
+            
+            pjsua_call_info call_info;
+            pj_status_t status = pjsua_call_get_info(call_id, &call_info);
+            
+            if (status != PJ_SUCCESS) 
             {
-                pjsua_call_hangup(call_ids[i], 486, NULL, NULL);
                 call_ids[i] = -1;
+                ready++;
+                continue;
+            }
+            
+            if (call_info.state == PJSIP_INV_STATE_CONFIRMED) 
+            {
+                pj_uint32_t call_duration = call_info.connect_duration.sec;
+                
+                if (call_duration >= MAX_ANSWER_DURATION_SEC) 
+                {
+                    PJ_LOG(1, (__FILE__, "==Call %d timeout, duration: %d sec==", call_id, call_duration));
+                    pjsua_call_hangup(call_id, 486, NULL, NULL);
+                    call_ids[i] = -1;
+                    ready++;
+                }
             }
         }
-
-        pj_atomic_inc(update_counter[*tid]);
+        
+        if (ready > 0) 
+        {
+            PJ_LOG(1, (__FILE__, "==UPDATER %d ready %d calls==", tid, ready));
+        }
+        
+        pj_atomic_set(update_counter[tid], 0);
     }
     
     return 0;
@@ -499,7 +520,7 @@ int start_answerphone(const char* sip_user, const char* sip_domain)
 
     for (int i = 0; i < UPDATERS_COUNT; i++)
     {
-        pj_atomic_create(main_pool, 1, &update_counter[i]);
+        pj_atomic_create(main_pool, 0, &update_counter[i]);
     }
 
     pj_thread_create(main_pool, "oberver", &observe_calls_arr, NULL, PJ_THREAD_DEFAULT_STACK_SIZE, 0, &observer);
@@ -507,6 +528,7 @@ int start_answerphone(const char* sip_user, const char* sip_domain)
     for (int i = 0; i < UPDATERS_COUNT; i++)
     {
         int* tid = pj_pool_zalloc(main_pool, sizeof(int)); 
+        *tid = i;
         pj_thread_create(main_pool, "updater", &update_calls_status, (void*)tid, PJ_THREAD_DEFAULT_STACK_SIZE, 0, &updaters[i]);
     }
 
