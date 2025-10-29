@@ -7,22 +7,20 @@ typedef enum response_mode
 {
     CONTINUOUS_SIGNAL,
     FROM_WAV_SIGNAL,
-    RBT_SIGNAL
+    RBT_SIGNAL,
+    MODE_COUNT
 } response_mode;
 
-typedef struct dlg_info 
+typedef struct slot_info
 {
-    pjsua_call_id call_id;
-    response_mode call_mode;
-    unsigned int duration;
-    const char* filename;
-    pj_pool_t* thread_pool;
-} dlg_info;
-
-static pj_mutex_t* mut;
+    pjmedia_port* port;
+    pjsua_conf_port_id conf_slot;
+    char is_enabled;
+} slot_info;
 
 static pj_caching_pool ch_pool;
 static pj_pool_t* main_pool;
+static pj_pool_t* media_session_pool;
 static pj_timer_heap_t* t_heap;
 
 static pjsua_acc_id acc_id;
@@ -33,7 +31,14 @@ static pjsua_logging_config log_cfg;
 static pjsua_transport_config t_cfg;
 static pjsua_acc_config acc_cfg;
 
-static int send_media(void*);
+static slot_info* slots;
+
+static pjsua_call_id call_ids[PJSUA_MAX_CALLS];
+static pj_atomic_t* update_counter[UPDATERS_COUNT]; 
+static pj_thread_t* observer;
+static pj_thread_t* updaters[UPDATERS_COUNT];
+
+static int enable_conf_slot(response_mode, const char*);
 static int create_transport();
 static int create_pools();
 static int create_timer_heap();
@@ -41,8 +46,17 @@ static int add_account(const char*, const char*);
 
 static void cleanup_resources()
 {
-    pj_mutex_destroy(mut);
+    for (int i = 0; i < MODE_COUNT; i++)
+    {
+        if (!slots[i].is_enabled)
+        continue;
+        
+        pjsua_conf_remove_port(slots[i].conf_slot);
+        pjmedia_port_destroy(slots[i].port);
+    }
+
     pj_timer_heap_destroy(t_heap);
+    pj_pool_release(media_session_pool);
     pj_pool_release(main_pool);
     pj_caching_pool_destroy(&ch_pool);
     pjsua_destroy();
@@ -67,33 +81,129 @@ static void answer_timer_callback(pj_timer_heap_t* timer_heap, pj_timer_entry* e
         PJ_LOG(1, (__FILE__, "==pjsua_call_answer error (200)=="));
         return;
     }
-
-    char* temp_pn = pj_pool_zalloc(main_pool, 16);
-    snprintf(temp_pn, 16, "%dtp", call_id);
-    pj_pool_t* thread_pool = pj_pool_create(&ch_pool.factory, temp_pn, THREAD_POOL_SIZE, THREAD_POOL_INC_SIZE, NULL);
-    if (!thread_pool)
+    
+    int call_mode = call_id % MODE_COUNT;
+    switch (call_mode)
     {
-        PJ_LOG(1, (__FILE__, "==pj_pool_create error=="));
-        return;
+        case CONTINUOUS_SIGNAL:
+            if (enable_conf_slot(CONTINUOUS_SIGNAL, NULL) != PJ_SUCCESS)
+            {
+                PJ_LOG(1, (__FILE__, "==enable_conf_slot error(CONTINUOUS_SIGNAL)=="));
+                pjsua_call_hangup(call_id, 486, NULL, NULL);
+                return;
+            }
+            break;
+        
+        case RBT_SIGNAL:
+            if (enable_conf_slot(RBT_SIGNAL, NULL) != PJ_SUCCESS)
+            {
+                PJ_LOG(1, (__FILE__, "==enable_conf_slot error(RBT_SIGNAL)=="));
+                pjsua_call_hangup(call_id, 486, NULL, NULL);
+                return;
+            }
+            break;
+
+        case FROM_WAV_SIGNAL:
+            if (enable_conf_slot(FROM_WAV_SIGNAL, DEFAULT_WAV_PATH) != PJ_SUCCESS)
+            {
+                PJ_LOG(1, (__FILE__, "==enable_conf_slot error(FROM_WAV_SIGNAL)=="));
+                pjsua_call_hangup(call_id, 486, NULL, NULL);
+                return;
+            }
+            break;
+
+        default:
+            PJ_LOG(1, (__FILE__, "==can't find such response mode=="));
+            pjsua_call_hangup(call_id, 486, NULL, NULL);
+            return;
     }
 
-    dlg_info* cur_dlg_info = pj_pool_zalloc(thread_pool, sizeof(dlg_info));
-    cur_dlg_info->call_id = call_id;
-    cur_dlg_info->call_mode = CONTINUOUS_SIGNAL;
-    cur_dlg_info->duration = 2000;
-    cur_dlg_info->filename = DEFAULT_WAV_PATH;
-    cur_dlg_info->thread_pool = thread_pool;
-    
-    pj_thread_t* thread;
-    char* temp_tn = pj_pool_zalloc(main_pool, 16);
-    snprintf(temp_tn, 16, "%dt", call_id);
-    status = pj_thread_create(thread_pool, temp_tn, &send_media, (void*)cur_dlg_info, PJ_THREAD_DEFAULT_STACK_SIZE, 0, &thread);
+    pjsua_call_info call_info;
+    status = pjsua_call_get_info(call_id, &call_info);
     if (status != PJ_SUCCESS)
     {
-        PJ_LOG(1, (__FILE__, "==pj_thread_create error=="));
-        pj_pool_release(thread_pool);
+        PJ_LOG(1, (__FILE__, "==pjsua_call_get_info error=="));
+        pjsua_call_hangup(call_id, 486, NULL, NULL);
         return;
     }
+
+    status = pjsua_conf_connect(slots[call_mode].conf_slot, call_info.conf_slot);
+    if (status != PJ_SUCCESS)
+    {
+        PJ_LOG(1, (__FILE__, "==pjsua_conf_connect error=="));
+        pjsua_call_hangup(call_id, 486, NULL, NULL);
+        return;
+    }
+}
+
+static int enable_conf_slot(response_mode mode, const char* filename)
+{
+    if (slots[mode].is_enabled)
+    {
+        return PJ_SUCCESS;
+    }
+
+    pj_status_t status;
+    pjmedia_port* media_port = pj_pool_zalloc(media_session_pool, sizeof(pjmedia_port));
+    if (!media_port)
+    {
+        PJ_LOG(1, (__FILE__, "==pj_pool_zalloc error(media_port)=="));
+        pj_pool_release(media_session_pool);
+        return -1;
+    }
+    slots[mode].port = media_port;
+
+    switch (mode)
+    {
+        case CONTINUOUS_SIGNAL:
+        case RBT_SIGNAL:
+            {
+                status = pjmedia_tonegen_create(media_session_pool, PJSUA_DEFAULT_CLOCK_RATE, 1, PJSUA_CALL_SEND_DTMF_DURATION_DEFAULT, 16, 0, &media_port);
+                if (status != PJ_SUCCESS)
+                {
+                    PJ_LOG(1, (__FILE__, "==pjmedia_tonegen_create error=="));
+                    pj_pool_release(media_session_pool);
+                    return -1;
+                }
+
+                pjmedia_tone_desc* tone = pj_pool_zalloc(media_session_pool, sizeof(pjmedia_tone_desc));
+                tone->freq1 = 425;
+                tone->freq2 = 0;
+                tone->off_msec = mode == CONTINUOUS_SIGNAL ? 0 : 4000;
+                tone->on_msec = 1000;
+
+                status = pjmedia_tonegen_play(media_port, 1, tone, PJMEDIA_TONEGEN_LOOP);
+                if (status != PJ_SUCCESS)
+                {
+                    PJ_LOG(1, (__FILE__, "==pjmedia_tonegen_play error=="));
+                    pj_pool_release(media_session_pool);
+                    return -1;
+                }
+                break;
+            }
+        case FROM_WAV_SIGNAL:
+            {
+                status = pjmedia_wav_player_port_create(media_session_pool, filename, 0, 0, 0, &media_port);
+                if (status != PJ_SUCCESS)
+                {
+                    PJ_LOG(1, (__FILE__, "==pjmedia_wav_player_port_create error=="));
+                    pj_pool_release(media_session_pool);
+                    return -1;
+                }
+                break;
+            }
+    }
+
+    status = pjsua_conf_add_port(media_session_pool, media_port, &slots[mode].conf_slot);
+    if (status != PJ_SUCCESS)
+    {
+        PJ_LOG(1, (__FILE__, "==pjsua_conf_add_port error=="));
+        pj_pool_release(media_session_pool);
+        return -1;
+    }
+    slots[mode].is_enabled = 1;
+
+    return PJ_SUCCESS;
 }
 
 static void on_incoming_call(pjsua_acc_id acc_id, pjsua_call_id call_id, pjsip_rx_data* rdata)
@@ -111,7 +221,7 @@ static void on_incoming_call(pjsua_acc_id acc_id, pjsua_call_id call_id, pjsip_r
         return;
     }
 
-    //PJ_LOG(3, (__FILE__, "Call %d state=%.*s", call_id, (int)info.state_text.slen, info.state_text.ptr));
+    PJ_LOG(3, (__FILE__, "Call %d state=%.*s", call_id, (int)info.state_text.slen, info.state_text.ptr));
 
     status = pjsua_call_answer(call_id, 180, NULL, NULL);
     if (status != PJ_SUCCESS)
@@ -139,142 +249,6 @@ static void on_incoming_call(pjsua_acc_id acc_id, pjsua_call_id call_id, pjsip_r
     }
 }
 
-static int send_media(void* data)
-{
-    pj_mutex_lock(mut);
-    dlg_info* cur_info = (dlg_info*)data;
-
-    pj_status_t status;
-    char* temp = pj_pool_zalloc(main_pool, 16);
-    snprintf(temp, 16, "%dms", cur_info->call_id);
-
-    pj_pool_t* media_session_pool = pj_pool_create(&ch_pool.factory, temp, MEDIA_POOL_SIZE, MEDIA_POOL_INC_SIZE, NULL);
-    if (!media_session_pool)
-    {
-        PJ_LOG(1, (__FILE__, "==pj_pool_create error=="));
-        pjsua_call_hangup(cur_info->call_id, 486, NULL, NULL);
-        return -1;
-    }
-
-    pjmedia_port* media_port = pj_pool_zalloc(media_session_pool, sizeof(pjmedia_port));
-    if (!media_port)
-    {
-        PJ_LOG(1, (__FILE__, "==pj_pool_zalloc for media_port error=="));
-        pj_pool_release(media_session_pool);
-        pjsua_call_hangup(cur_info->call_id, 486, NULL, NULL);
-        return -1;
-    }
-
-    if (cur_info->call_mode == CONTINUOUS_SIGNAL || cur_info->call_mode == RBT_SIGNAL)
-    {
-        status = pjmedia_tonegen_create(media_session_pool, PJSUA_DEFAULT_CLOCK_RATE, 1, PJSUA_CALL_SEND_DTMF_DURATION_DEFAULT, 16, 0, &media_port);
-        if (status != PJ_SUCCESS)
-        {
-            PJ_LOG(1, (__FILE__, "==pjmedia_tonegen_create error=="));
-            pj_pool_release(media_session_pool);
-            pjsua_call_hangup(cur_info->call_id, 486, NULL, NULL);
-            return -1;
-        }
-    }
-    else if (cur_info->call_mode == FROM_WAV_SIGNAL)
-    {
-        status = pjmedia_wav_player_port_create(media_session_pool, cur_info->filename, 0, 0, 0, &media_port);
-        if (status != PJ_SUCCESS)
-        {
-            PJ_LOG(1, (__FILE__, "==pjmedia_wav_player_port_create error=="));
-            pj_pool_release(media_session_pool);
-            pjsua_call_hangup(cur_info->call_id, 486, NULL, NULL);
-            return -1;
-        }
-    }
-    else
-    {
-        PJ_LOG(1, (__FILE__, "==Can't find such response mode: %d==", cur_info->call_mode));
-        pj_pool_release(media_session_pool);
-        pjsua_call_hangup(cur_info->call_id, 486, NULL, NULL);
-        return -1;
-    }
-
-    pjsua_conf_port_id conf_slot;
-    status = pjsua_conf_add_port(media_session_pool, media_port, &conf_slot);
-    if (status != PJ_SUCCESS)
-    {
-        PJ_LOG(1, (__FILE__, "==pjsua_conf_add_port error=="));
-        pj_pool_release(media_session_pool);
-        pjsua_call_hangup(cur_info->call_id, 486, NULL, NULL);
-        return -1;
-    }
-
-    pjsua_call_info call_info;
-    status = pjsua_call_get_info(cur_info->call_id, &call_info);
-    if (status != PJ_SUCCESS)
-    {
-        PJ_LOG(1, (__FILE__, "==pjsua_call_get_info error=="));
-        pjsua_conf_remove_port(conf_slot);
-        pj_pool_release(media_session_pool);
-        pjsua_call_hangup(cur_info->call_id, 486, NULL, NULL);
-        return -1;
-    }
-
-    status = pjsua_conf_connect(conf_slot, call_info.conf_slot);
-    if (status != PJ_SUCCESS)
-    {
-        PJ_LOG(1, (__FILE__, "==pjsua_conf_connect error=="));
-        pjsua_conf_remove_port(conf_slot);
-        pj_pool_release(media_session_pool);
-        pjsua_call_hangup(cur_info->call_id, 486, NULL, NULL);
-        return -1;
-    }
-    pj_mutex_unlock(mut);
-
-    switch (cur_info->call_mode)
-    {
-        case FROM_WAV_SIGNAL:
-        {
-            pj_thread_sleep(cur_info->duration);
-            break;
-        }
-
-        case CONTINUOUS_SIGNAL:
-        case RBT_SIGNAL: 
-        {
-            PJ_LOG(3, (__FILE__, "Tone 425Hz started for call %d | call_mode=%d, conf_slot=%d", cur_info->call_id, cur_info->call_mode, conf_slot));
-
-            pjmedia_tone_desc tone;
-            tone.freq1 = 425;
-            tone.freq2 = 0;
-            tone.off_msec = cur_info->call_mode == CONTINUOUS_SIGNAL ? 0 : 4000;
-            tone.on_msec = 1000;
-
-            status = pjmedia_tonegen_play(media_port, 1, &tone, PJMEDIA_TONEGEN_LOOP);
-            if (status == PJ_SUCCESS)
-            {
-                pj_thread_sleep(cur_info->duration);
-            }
-            break;
-        }
-    }
-
-    pj_mutex_lock(mut);
-    status = pjsua_call_get_info(cur_info->call_id, &call_info);
-    if (status == PJ_SUCCESS)
-    {
-        pjsua_conf_disconnect(conf_slot, call_info.conf_slot);
-        pjsua_conf_remove_port(conf_slot);
-        pjsua_call_hangup(cur_info->call_id, 486, NULL, NULL);
-    }
-    else
-    {
-        pjsua_conf_remove_port(conf_slot);
-    }
-    pj_pool_release(media_session_pool);
-    pj_pool_release(cur_info->thread_pool);
-    PJ_LOG(1, (__FILE__, "==ACTIVE_PORTS=%d==", pjsua_conf_get_active_ports()));
-    pj_mutex_unlock(mut);
-
-    return PJ_SUCCESS;
-}
-
 int init_answerphone()
 {
     pj_status_t status;
@@ -287,11 +261,11 @@ int init_answerphone()
     }
 
     pjsua_config_default(&cfg);
-    cfg.max_calls = MAX_CALLS;
+    cfg.max_calls = PJSUA_MAX_CALLS;
     cfg.cb.on_incoming_call = &on_incoming_call;
 
     pjsua_media_config_default(&med_cfg);
-    med_cfg.max_media_ports = MAX_CALLS + 2;
+    med_cfg.max_media_ports = PJSUA_MAX_CONF_PORTS;
 
     pjsua_logging_config_default(&log_cfg);
     log_cfg.msg_logging = PJ_TRUE;
@@ -327,19 +301,10 @@ int init_answerphone()
         return -1;
     }
 
-    status = pj_mutex_create(main_pool, "mutex", PJ_MUTEX_SIMPLE, &mut);
-    if (status != PJ_SUCCESS)
-    {
-        pj_pool_release(main_pool);
-        pj_caching_pool_destroy(&ch_pool);
-        pjsua_destroy();
-        return -1;
-    }
-
     if (create_timer_heap() != PJ_SUCCESS)
     {
-        pj_mutex_destroy(mut);
         pj_pool_release(main_pool);
+        pj_pool_release(media_session_pool);
         pj_caching_pool_destroy(&ch_pool);
         pjsua_destroy();
         return -1;
@@ -369,7 +334,14 @@ static int create_pools()
     main_pool = pj_pool_create(&ch_pool.factory, "main", MAIN_POOL_SIZE, MAIN_POOL_SIZE, NULL);
     if (!main_pool)
     {
-        PJ_LOG(1, (__FILE__, "==pj_pool_create error=="));
+        PJ_LOG(1, (__FILE__, "==pj_pool_create error(main_pool)=="));
+        return -1;
+    }
+
+    media_session_pool = pj_pool_create(&ch_pool.factory, "media_session", MEDIA_POOL_SIZE, MEDIA_POOL_INC_SIZE, NULL);
+    if (!media_session_pool)
+    {
+        PJ_LOG(1, (__FILE__, "==pj_pool_create error(media_session_pool)=="));
         return -1;
     }
 
@@ -421,6 +393,83 @@ static int add_account(const char* sip_user, const char* sip_domain)
     return status;
 }
 
+static int observe_calls_arr()
+{
+    int ready_count = 0;
+    for (int i = 0; i < PJSUA_MAX_CALLS; i++)
+    {
+        call_ids[i] = -1;
+    }
+
+    while (1)
+    {
+        ready_count = 0;
+
+        while (ready_count != UPDATERS_COUNT)
+        {
+            pj_thread_sleep(1000);
+
+            ready_count = 0;
+            for (int i = 0; i < UPDATERS_COUNT; i++)
+            {
+                ready_count += pj_atomic_get(update_counter[i]);
+            }
+        }
+
+        PJ_LOG(1, (__FILE__, "==OBSERVE_CALLS=="));
+        pjsua_call_id cur_calls[PJSUA_MAX_CALLS];
+        unsigned int cur_count;
+        pjsua_enum_calls(cur_calls, &cur_count);
+        for (int i = 0; i < cur_count; i++)
+        {
+            call_ids[cur_calls[i] % PJSUA_MAX_CALLS] = cur_calls[i]; 
+        }
+
+        for (int i = 0; i < UPDATERS_COUNT; i++)
+        {
+            pj_atomic_dec(update_counter[i]);
+        }
+    }
+
+    return 0;
+}
+
+static int update_calls_status(void* data)
+{
+    int* tid = (int*)data;
+    int chunk = PJSUA_MAX_CALLS / UPDATERS_COUNT;
+    int l_br = *tid * chunk;
+    int u_br = *tid == (UPDATERS_COUNT - 1) ? PJSUA_MAX_CALLS : l_br + chunk;
+    pj_status_t status;
+    pjsua_call_info call_info;
+
+    while (1)
+    {
+        while (pj_atomic_get(update_counter[*tid]) == 1)
+        {
+            pj_thread_sleep(1000);
+        }
+        
+        PJ_LOG(1, (__FILE__, "==UPDATE_CALLS=="));
+        for (int i = l_br; i < u_br; i++)
+        {
+            if (call_ids[i] == -1)
+                continue;
+
+            status = pjsua_call_get_info(call_ids[i], &call_info);
+            if (status != PJ_SUCCESS || ((call_info.total_duration.sec - call_info.connect_duration.sec) >= MAX_ANSWER_DURATION_SEC))
+            {
+                pjsua_call_hangup(call_ids[i], 486, NULL, NULL);
+                call_ids[i] = -1;
+            }
+        }
+
+        pj_atomic_inc(update_counter[*tid]);
+    }
+    
+    return 0;
+}
+
 int start_answerphone(const char* sip_user, const char* sip_domain)
 {
     pj_status_t status;
@@ -438,6 +487,27 @@ int start_answerphone(const char* sip_user, const char* sip_domain)
         PJ_LOG(1, (__FILE__, "==pjsua_start error=="));
         cleanup_resources();
         return -1;
+    }
+
+    slots = pj_pool_zalloc(main_pool, sizeof(slot_info) * MODE_COUNT);
+    if (!slots)
+    {
+        PJ_LOG(1, (__FILE__, "==pj_pool_zalloc error(slots)=="));
+        cleanup_resources();
+        return -1;
+    }
+
+    for (int i = 0; i < UPDATERS_COUNT; i++)
+    {
+        pj_atomic_create(main_pool, 1, &update_counter[i]);
+    }
+
+    pj_thread_create(main_pool, "oberver", &observe_calls_arr, NULL, PJ_THREAD_DEFAULT_STACK_SIZE, 0, &observer);
+
+    for (int i = 0; i < UPDATERS_COUNT; i++)
+    {
+        int* tid = pj_pool_zalloc(main_pool, sizeof(int)); 
+        pj_thread_create(main_pool, "updater", &update_calls_status, (void*)tid, PJ_THREAD_DEFAULT_STACK_SIZE, 0, &updaters[i]);
     }
 
     if (add_account(sip_user, sip_domain) != PJ_SUCCESS)
