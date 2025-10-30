@@ -253,18 +253,6 @@ static void on_incoming_call(pjsua_acc_id acc_id, pjsua_call_id call_id, pjsip_r
     }
 }
 
-static void on_call_state(pjsua_call_id call_id, pjsip_event* e)
-{
-    PJ_UNUSED_ARG(e);
-    pjsua_call_info call_info;
-    pjsua_call_get_info(call_id, &call_info);
-
-    if (call_info.state == PJSIP_INV_STATE_DISCONNECTED)
-    {
-        pjsua_call_hangup(call_id, 500, NULL, NULL);
-    }
-}
-
 int init_answerphone()
 {
     pj_status_t status;
@@ -279,7 +267,6 @@ int init_answerphone()
     pjsua_config_default(&cfg);
     cfg.max_calls = PJSUA_MAX_CALLS;
     cfg.cb.on_incoming_call = &on_incoming_call;
-    cfg.cb.on_call_state = &on_call_state;
 
     pjsua_media_config_default(&med_cfg);
     med_cfg.max_media_ports = PJSUA_MAX_CONF_PORTS;
@@ -449,7 +436,7 @@ static int observe_calls_arr()
         }
         
         cycles_before_check--;
-        pj_thread_sleep(1000);
+        pj_thread_sleep(100);
     }
 
     return 0;
