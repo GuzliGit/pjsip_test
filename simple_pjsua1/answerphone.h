@@ -5,6 +5,7 @@
 #define MEDIA_POOL_SIZE 512
 #define MEDIA_POOL_INC_SIZE 128
 
+#define OBSERVER_CYCLES_COUNT 4
 #define UPDATERS_COUNT 3
 #define MAX_ANSWER_DURATION_SEC 10
 
@@ -12,7 +13,7 @@
 #define MAX_DOMAIN_LEN 64
 #define MAX_CALLS 20
 
-#define DEFAULT_PASSWD "passwd"
+#define DEFAULT_PASSWD "Passwd123"
 #define DEFAULT_WAV_PATH "./media/test.wav"
 
 int init_answerphone();

@@ -85,8 +85,7 @@ static void answer_timer_callback(pj_timer_heap_t* timer_heap, pj_timer_entry* e
 {
     pj_status_t status;
     pjsua_call_id call_id = (pjsua_call_id)(long)entry->user_data;
-
-    PJ_LOG(1, (__FILE__, "==Answer_timer_callback=="));
+    
     status = pjsua_call_answer(call_id, 200, NULL, NULL);
     if (status != PJ_SUCCESS)
     {
@@ -97,7 +96,7 @@ static void answer_timer_callback(pj_timer_heap_t* timer_heap, pj_timer_entry* e
     
     pjsua_call_info call_info;
     status = pjsua_call_get_info(call_id, &call_info);
-    if (status != PJ_SUCCESS)
+    if (status != PJ_SUCCESS || call_info.state == PJSIP_INV_STATE_DISCONNECTED)
     {
         PJ_LOG(1, (__FILE__, "==pjsua_call_get_info error=="));
         pjsua_call_hangup(call_id, 500, NULL, NULL);
@@ -230,6 +229,7 @@ static void on_incoming_call(pjsua_acc_id acc_id, pjsua_call_id call_id, pjsip_r
     if (status != PJ_SUCCESS)
     {
         PJ_LOG(1, (__FILE__, "==pjsua_call_answer error (180)=="));
+        pjsua_call_hangup(call_id, 500, NULL, NULL);
         return;
     }
 
@@ -237,6 +237,7 @@ static void on_incoming_call(pjsua_acc_id acc_id, pjsua_call_id call_id, pjsip_r
     if (!timer)
     {
         PJ_LOG(1, (__FILE__, "==pj_pool_zalloc for timer error=="));
+        pjsua_call_hangup(call_id, 500, NULL, NULL);
         return;
     }
 
@@ -249,6 +250,18 @@ static void on_incoming_call(pjsua_acc_id acc_id, pjsua_call_id call_id, pjsip_r
     {
         pjsua_call_hangup(call_id, 500, NULL, NULL);
         return;
+    }
+}
+
+static void on_call_state(pjsua_call_id call_id, pjsip_event* e)
+{
+    PJ_UNUSED_ARG(e);
+    pjsua_call_info call_info;
+    pjsua_call_get_info(call_id, &call_info);
+
+    if (call_info.state == PJSIP_INV_STATE_DISCONNECTED)
+    {
+        pjsua_call_hangup(call_id, 500, NULL, NULL);
     }
 }
 
@@ -266,13 +279,14 @@ int init_answerphone()
     pjsua_config_default(&cfg);
     cfg.max_calls = PJSUA_MAX_CALLS;
     cfg.cb.on_incoming_call = &on_incoming_call;
+    cfg.cb.on_call_state = &on_call_state;
 
     pjsua_media_config_default(&med_cfg);
     med_cfg.max_media_ports = PJSUA_MAX_CONF_PORTS;
 
     pjsua_logging_config_default(&log_cfg);
     log_cfg.msg_logging = PJ_TRUE;
-    log_cfg.console_level = 4;
+    log_cfg.console_level = 1;
 
     status = pjsua_init(&cfg, &log_cfg, &med_cfg);
     if (status != PJ_SUCCESS)
@@ -380,12 +394,12 @@ static int add_account(const char* sip_user, const char* sip_domain)
     acc_cfg.id = pj_str(id);
     acc_cfg.reg_uri = pj_str(reg_uri);
     acc_cfg.cred_count = 1;
-    acc_cfg.cred_info[0].realm = pj_str("*");
+    acc_cfg.cred_info[0].realm = pj_str(realm);
     acc_cfg.cred_info[0].scheme = pj_str("digest");
     acc_cfg.cred_info[0].username = pj_str(username);
     acc_cfg.cred_info[0].data_type = PJSIP_CRED_DATA_PLAIN_PASSWD;
     acc_cfg.cred_info[0].data = pj_str(DEFAULT_PASSWD);
-    acc_cfg.register_on_acc_add = PJ_FALSE;
+    //acc_cfg.register_on_acc_add = PJ_FALSE;
 
     status = pjsua_acc_add(&acc_cfg, PJ_TRUE, &acc_id);
     if (status != PJ_SUCCESS)
@@ -399,6 +413,7 @@ static int add_account(const char* sip_user, const char* sip_domain)
 static int observe_calls_arr()
 {
     int ready_count = 0;
+    int cycles_before_check = OBSERVER_CYCLES_COUNT;
     pj_status_t status;
     
     for (int i = 0; i < PJSUA_MAX_CALLS; i++) 
@@ -422,15 +437,18 @@ static int observe_calls_arr()
             unsigned int cur_count = PJSUA_MAX_CALLS;
             status = pjsua_enum_calls(call_ids, &cur_count);
             
-            if (status == PJ_SUCCESS)
+            if (status == PJ_SUCCESS || cycles_before_check <= 0)
             {
                 for (int i = 0; i < UPDATERS_COUNT; i++) 
                 {
                     pj_atomic_set(update_counter[i], 1);
                 }
+
+                cycles_before_check = OBSERVER_CYCLES_COUNT;
             }
         }
         
+        cycles_before_check--;
         pj_thread_sleep(1000);
     }
 
