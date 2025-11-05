@@ -33,20 +33,33 @@ static pjsua_acc_config acc_cfg;
 
 static slot_info* slots;
 
-static pjsua_call_id call_ids[PJSUA_MAX_CALLS];
-static pj_atomic_t* update_counter[UPDATERS_COUNT]; 
-static pj_thread_t* observer;
+static pj_time_val call_timestamp[PJSUA_MAX_CALLS];
+static pj_mutex_t* update_mut[UPDATERS_COUNT];
 static pj_thread_t* updaters[UPDATERS_COUNT];
+
+static volatile char is_cleanup = 0;
 
 static int enable_conf_slot(response_mode, const char*);
 static int create_transport();
 static int create_pools();
 static int create_timer_heap();
 static int add_account(const char*, const char*);
-static int create_obesrvers_and_updaters();
+static int create_updaters();
 
 static void cleanup_resources()
 {
+    for (int i = 0; i < UPDATERS_COUNT; i++)
+    {   
+        if (updaters[i])
+        {
+            pj_thread_join(updaters[i]);
+            pj_thread_destroy(updaters[i]);
+        }
+
+        if (update_mut[i])
+            pj_mutex_destroy(update_mut[i]);
+    }
+
     for (int i = 0; i < MODE_COUNT; i++)
     {
         if (!slots[i].is_enabled)
@@ -55,30 +68,13 @@ static void cleanup_resources()
         pjsua_conf_remove_port(slots[i].conf_slot);
     }
 
-    if (observer)
-        pj_thread_destroy(observer);
-
-    for (int i = 0; i < UPDATERS_COUNT; i++)
-    {
-        if (update_counter[i])
-            pj_atomic_destroy(update_counter[i]);
-        
-        if (updaters[i])
-            pj_thread_destroy(updaters[i]);
-    }
-
     pj_timer_heap_destroy(t_heap);
-    pj_pool_release(media_session_pool);
-    pj_pool_release(main_pool);
-    pj_caching_pool_destroy(&ch_pool);
     pjsua_destroy();
 }
 
 static void signal_handler()
 {
-    pjsua_call_hangup_all();
-    cleanup_resources();
-    exit(PJ_SUCCESS);
+    is_cleanup = 1;
 }
 
 static void answer_timer_callback(pj_timer_heap_t* timer_heap, pj_timer_entry* entry)
@@ -253,6 +249,38 @@ static void on_incoming_call(pjsua_acc_id acc_id, pjsua_call_id call_id, pjsip_r
     }
 }
 
+static void on_call_state(pjsua_call_id call_id, pjsip_event* e)
+{
+    PJ_UNUSED_ARG(e);
+
+    pj_status_t status;
+    pjsua_call_info call_info;
+    status = pjsua_call_get_info(call_id, &call_info);
+
+    if (status != PJ_SUCCESS)
+    {
+        return;
+    }
+    
+    pj_time_val cur_time = {-1, -1};
+    int thread_to_lock = call_id % UPDATERS_COUNT;
+
+    if (call_info.state == PJSIP_INV_STATE_EARLY || call_info.state == PJSIP_INV_STATE_CONFIRMED)
+    {
+        pj_gettimeofday(&cur_time);
+
+        pj_mutex_lock(update_mut[thread_to_lock]);
+        call_timestamp[call_id] = cur_time;
+        pj_mutex_unlock(update_mut[thread_to_lock]);
+    }
+    else if (call_info.state == PJSIP_INV_STATE_DISCONNECTED)
+    {
+        pj_mutex_lock(update_mut[thread_to_lock]);
+        call_timestamp[call_id] = cur_time;
+        pj_mutex_unlock(update_mut[thread_to_lock]);
+    }
+}
+
 int init_answerphone()
 {
     pj_status_t status;
@@ -267,13 +295,14 @@ int init_answerphone()
     pjsua_config_default(&cfg);
     cfg.max_calls = PJSUA_MAX_CALLS;
     cfg.cb.on_incoming_call = &on_incoming_call;
+    cfg.cb.on_call_state = &on_call_state;
 
     pjsua_media_config_default(&med_cfg);
     med_cfg.max_media_ports = PJSUA_MAX_CONF_PORTS;
 
     pjsua_logging_config_default(&log_cfg);
     log_cfg.msg_logging = PJ_TRUE;
-    log_cfg.console_level = 1;
+    log_cfg.console_level = 4;
 
     status = pjsua_init(&cfg, &log_cfg, &med_cfg);
     if (status != PJ_SUCCESS)
@@ -368,20 +397,18 @@ static int add_account(const char* sip_user, const char* sip_domain)
     pj_status_t status;
     pjsua_acc_config_default(&acc_cfg);
 
-    char* id = pj_pool_zalloc(main_pool, MAIN_POOL_SIZE);
-    char* reg_uri = pj_pool_zalloc(main_pool, MAIN_POOL_SIZE);
-    char* realm = pj_pool_zalloc(main_pool, MAX_DOMAIN_LEN); 
+    char* id = pj_pool_zalloc(main_pool, MAX_ID_LEN);
+    char* reg_uri = pj_pool_zalloc(main_pool, MAX_REG_URI_LEN);
     char* username = pj_pool_zalloc(main_pool, MAX_USERNAME_LEN);
     
-    snprintf(id, MAIN_POOL_SIZE, "sip:%s@%s", sip_user, sip_domain);
-    snprintf(reg_uri, MAIN_POOL_SIZE, "sip:%s", sip_domain);
-    snprintf(realm, MAX_DOMAIN_LEN, "%s", sip_domain);
+    snprintf(id, MAX_ID_LEN, "sip:%s@%s", sip_user, sip_domain);
+    snprintf(reg_uri, MAX_REG_URI_LEN, "sip:%s", sip_domain);
     snprintf(username, MAX_USERNAME_LEN, "%s", sip_user);
     
     acc_cfg.id = pj_str(id);
     acc_cfg.reg_uri = pj_str(reg_uri);
     acc_cfg.cred_count = 1;
-    acc_cfg.cred_info[0].realm = pj_str(realm);
+    acc_cfg.cred_info[0].realm = pj_str("*");
     acc_cfg.cred_info[0].scheme = pj_str("digest");
     acc_cfg.cred_info[0].username = pj_str(username);
     acc_cfg.cred_info[0].data_type = PJSIP_CRED_DATA_PLAIN_PASSWD;
@@ -397,107 +424,34 @@ static int add_account(const char* sip_user, const char* sip_domain)
     return status;
 }
 
-static int observe_calls_arr()
-{
-    int ready_count = 0;
-    int cycles_before_check = OBSERVER_CYCLES_COUNT;
-    pj_status_t status;
-    
-    for (int i = 0; i < PJSUA_MAX_CALLS; i++) 
-    {
-        call_ids[i] = -1;
-    }
-
-    while (1)
-    {
-        ready_count = 0;
-        for (int i = 0; i < UPDATERS_COUNT; i++) 
-        {
-            if (pj_atomic_get(update_counter[i]) == 0) 
-            {
-                ready_count++;
-            }
-        }
-
-        if (ready_count == UPDATERS_COUNT) 
-        {
-            unsigned int cur_count = PJSUA_MAX_CALLS;
-            status = pjsua_enum_calls(call_ids, &cur_count);
-            
-            if (status == PJ_SUCCESS || cycles_before_check <= 0)
-            {
-                for (int i = 0; i < UPDATERS_COUNT; i++) 
-                {
-                    pj_atomic_set(update_counter[i], 1);
-                }
-
-                cycles_before_check = OBSERVER_CYCLES_COUNT;
-            }
-        }
-        
-        cycles_before_check--;
-        pj_thread_sleep(100);
-    }
-
-    return 0;
-}
-
 static int update_calls_status(void* data)
 {
     int tid = *(int*)data;
-    int chunk = PJSUA_MAX_CALLS / UPDATERS_COUNT;
-    int l_br = tid * chunk;
-    int u_br = (tid == (UPDATERS_COUNT - 1)) ? PJSUA_MAX_CALLS : l_br + chunk;
     pj_status_t status;
-    pjsua_call_id call_id;
-    pjsua_call_info call_info;
-    pj_uint32_t call_duration;
-    
-    PJ_LOG(1, (__FILE__, "==UPDATER %d started: range %d-%d==", tid, l_br, u_br));
+    pj_time_val result_time;
 
-    while (1)
+    while (!is_cleanup)
     {
-        while (pj_atomic_get(update_counter[tid]) == 0) 
+        for (int i = tid; i < PJSUA_MAX_CALLS; i+=UPDATERS_COUNT)
         {
-            pj_thread_sleep(100);
-        }
-        
-        int ready = 0;
-        for (int i = l_br; i < u_br; i++) 
-        {
-            call_id = call_ids[i];
+            pj_gettimeofday(&result_time);
             
-            if (call_id == -1) 
-                continue;
-            
-            status = pjsua_call_get_info(call_id, &call_info);
-            
-            if (status != PJ_SUCCESS) 
+            pj_mutex_lock(update_mut[tid]);
+            if (call_timestamp[i].sec == -1)
             {
-                call_ids[i] = -1;
-                ready++;
+                pj_mutex_unlock(update_mut[tid]);
                 continue;
             }
+            PJ_TIME_VAL_SUB(result_time, call_timestamp[i]);
+            pj_mutex_unlock(update_mut[tid]);
             
-            if (call_info.state == PJSIP_INV_STATE_CONFIRMED) 
+            if (result_time.sec >= MAX_ANSWER_DURATION_SEC)
             {
-                call_duration = call_info.connect_duration.sec;
-                
-                if (call_duration >= MAX_ANSWER_DURATION_SEC) 
-                {
-                    pjsua_call_hangup(call_id, 486, NULL, NULL);
-                    call_ids[i] = -1;
-                    ready++;
-                }
+                pjsua_call_hangup(i, 500, NULL, NULL);
             }
         }
-        
-        if (ready > 0) 
-        {
-            PJ_LOG(1, (__FILE__, "==UPDATER %d ready %d calls==", tid, ready));
-        }
-        
-        pj_atomic_set(update_counter[tid], 0);
+
+        pj_thread_sleep(1000);
     }
     
     return 0;
@@ -530,7 +484,7 @@ int start_answerphone(const char* sip_user, const char* sip_domain)
         return -1;
     }
 
-    if (create_obesrvers_and_updaters() != PJ_SUCCESS)
+    if (create_updaters() != PJ_SUCCESS)
     {
         cleanup_resources();
         return -1;
@@ -542,7 +496,7 @@ int start_answerphone(const char* sip_user, const char* sip_domain)
         return -1;
     }
 
-    while (1)
+    while (!is_cleanup)
     {
         pj_timer_heap_poll(t_heap, NULL);
     }
@@ -552,24 +506,17 @@ int start_answerphone(const char* sip_user, const char* sip_domain)
     return PJ_SUCCESS;
 }
 
-static int create_obesrvers_and_updaters()
+static int create_updaters()
 {
     pj_status_t status;
     for (int i = 0; i < UPDATERS_COUNT; i++)
     {
-        status = pj_atomic_create(media_session_pool, 0, &update_counter[i]);
+        status = pj_mutex_create(media_session_pool, "upd_mut", PJ_MUTEX_DEFAULT, &update_mut[i]);
         if (status != PJ_SUCCESS)
         {
-            PJ_LOG(1, (__FILE__, "==pj_atomic_create error=="));
+            PJ_LOG(1, (__FILE__, "==pj_mutex_create error=="));
             return -1;
         }
-    }
-
-    status = pj_thread_create(media_session_pool, "oberver", &observe_calls_arr, NULL, PJ_THREAD_DEFAULT_STACK_SIZE, 0, &observer);
-    if (status != PJ_SUCCESS)
-    {
-        PJ_LOG(1, (__FILE__, "==pj_thread_create error(observer)=="));
-        return -1;
     }
 
     for (int i = 0; i < UPDATERS_COUNT; i++)
@@ -590,5 +537,12 @@ static int create_obesrvers_and_updaters()
         }
     }
 
+    for (int i = 0; i < PJSUA_MAX_CALLS; i++)
+    {
+        call_timestamp[i].sec = -1;
+        call_timestamp[i].msec = -1;
+    }
+
     return status;
 }
+
