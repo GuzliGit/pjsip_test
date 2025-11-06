@@ -4,7 +4,7 @@ CC_ARM64 = aarch64-linux-gnu-gcc
 BIN_DIR = bin
 OBJ_DIR = objs
 
-CFLAGS = $(shell pkg-config --cflags --libs libpjproject)
+CFLAGS = $(shell pkg-config --cflags --libs libpjproject) -fsanitize=address
 
 TARGET_x86_64 = $(BIN_DIR)/answerphone
 TARGET_ARM64 = $(BIN_DIR)/answerphone-arm

@@ -22,6 +22,7 @@ static pj_caching_pool ch_pool;
 static pj_pool_t* main_pool;
 static pj_pool_t* media_session_pool;
 static pj_timer_heap_t* t_heap;
+static pj_pool_t* timers_pools[2];
 
 static pjsua_acc_id acc_id;
 
@@ -38,6 +39,7 @@ static pj_mutex_t* update_mut[UPDATERS_COUNT];
 static pj_thread_t* updaters[UPDATERS_COUNT];
 
 static volatile char is_cleanup = 0;
+static volatile char active_timers_pool = 0;
 
 static int enable_conf_slot(response_mode, const char*);
 static int create_transport();
@@ -80,7 +82,7 @@ static void signal_handler()
 static void answer_timer_callback(pj_timer_heap_t* timer_heap, pj_timer_entry* entry)
 {
     pj_status_t status;
-    pjsua_call_id call_id = (pjsua_call_id)(long)entry->user_data;
+    pjsua_call_id call_id = (pjsua_call_id)((long)entry->user_data);
     
     status = pjsua_call_answer(call_id, 200, NULL, NULL);
     if (status != PJ_SUCCESS)
@@ -208,9 +210,16 @@ static void on_incoming_call(pjsua_acc_id acc_id, pjsua_call_id call_id, pjsip_r
 {
     pj_status_t status;
     pjsua_call_info info;
+    pj_time_val delay = {1, 0};
 
     PJ_UNUSED_ARG(acc_id);
     PJ_UNUSED_ARG(rdata);
+
+    if (pj_pool_get_used_size(timers_pools[active_timers_pool]) >= TIMERS_POOL_SIZE * 0.9)
+    {
+        active_timers_pool = active_timers_pool == 0 ? 1 : 0; 
+        pj_pool_reset(timers_pools[active_timers_pool]);
+    }
 
     status = pjsua_call_get_info(call_id, &info);
     if (status != PJ_SUCCESS)
@@ -218,8 +227,6 @@ static void on_incoming_call(pjsua_acc_id acc_id, pjsua_call_id call_id, pjsip_r
         pjsua_call_hangup(call_id, 486, NULL, NULL);
         return;
     }
-
-    PJ_LOG(3, (__FILE__, "Call %d state=%.*s", call_id, (int)info.state_text.slen, info.state_text.ptr));
 
     status = pjsua_call_answer(call_id, 180, NULL, NULL);
     if (status != PJ_SUCCESS)
@@ -229,18 +236,16 @@ static void on_incoming_call(pjsua_acc_id acc_id, pjsua_call_id call_id, pjsip_r
         return;
     }
 
-    pj_timer_entry* timer = pj_pool_zalloc(main_pool, sizeof(pj_timer_entry));
+    pj_timer_entry* timer = pj_pool_zalloc(timers_pools[active_timers_pool], sizeof(pj_timer_entry));
     if (!timer)
     {
         PJ_LOG(1, (__FILE__, "==pj_pool_zalloc for timer error=="));
         pjsua_call_hangup(call_id, 500, NULL, NULL);
         return;
     }
-
-    pj_timer_entry_init(timer, PJSUA_INVALID_ID, NULL, &answer_timer_callback);
-    timer->user_data = (void*)(long)call_id;
-
-    pj_time_val delay = {1, 0};
+    
+    pj_timer_entry_init(timer, PJSUA_INVALID_ID, (void*)(long)call_id, &answer_timer_callback);
+    
     status = pj_timer_heap_schedule(t_heap, timer, &delay);
     if (status != PJ_SUCCESS)
     {
@@ -302,7 +307,7 @@ int init_answerphone()
 
     pjsua_logging_config_default(&log_cfg);
     log_cfg.msg_logging = PJ_TRUE;
-    log_cfg.console_level = 4;
+    log_cfg.console_level = 2;
 
     status = pjsua_init(&cfg, &log_cfg, &med_cfg);
     if (status != PJ_SUCCESS)
@@ -336,6 +341,8 @@ int init_answerphone()
 
     if (create_timer_heap() != PJ_SUCCESS)
     {
+        pj_pool_release(timers_pools[0]);
+        pj_pool_release(timers_pools[1]);
         pj_pool_release(media_session_pool);
         pj_pool_release(main_pool);
         pj_caching_pool_destroy(&ch_pool);
@@ -378,12 +385,26 @@ static int create_pools()
         return -1;
     }
 
+    timers_pools[0] = pj_pool_create(&ch_pool.factory, "timers_pool", TIMERS_POOL_SIZE, TIMERS_POOL_SIZE, NULL);
+    if (!timers_pools[0])
+    {
+        PJ_LOG(1, (__FILE__, "==pj_pool_create error(timers_pool)=="));
+        return -1;
+    }
+
+    timers_pools[1] = pj_pool_create(&ch_pool.factory, "timers_pool", TIMERS_POOL_SIZE, TIMERS_POOL_SIZE, NULL);
+    if (!timers_pools[1])
+    {
+        PJ_LOG(1, (__FILE__, "==pj_pool_create error(timers_pool)=="));
+        return -1;
+    }
+
     return PJ_SUCCESS;
 }
 
 static int create_timer_heap()
 {
-    pj_status_t status = pj_timer_heap_create(main_pool, PJSUA_MAX_CALLS*2, &t_heap);
+    pj_status_t status = pj_timer_heap_create(main_pool, PJSUA_MAX_CALLS, &t_heap);
     if (status != PJ_SUCCESS)
     {
         PJ_LOG(1, (__FILE__, "==pj_timer_heap_create error=="));
@@ -496,9 +517,14 @@ int start_answerphone(const char* sip_user, const char* sip_domain)
         return -1;
     }
 
+    pj_time_val delay = {0, 10};
     while (!is_cleanup)
     {
         pj_timer_heap_poll(t_heap, NULL);
+        pjsip_endpt_handle_events(pjsua_get_pjsip_endpt(), &delay);
+        PJ_LOG(1, (__FILE__, "==TIMERS POOL[1] SIZE: %ld==", pj_pool_get_used_size(timers_pools[0])));
+        PJ_LOG(1, (__FILE__, "==TIMERS POOL[2] SIZE: %ld==", pj_pool_get_used_size(timers_pools[1])));
+        pj_thread_sleep(10);
     }
 
     pjsua_call_hangup_all();
@@ -518,7 +544,7 @@ static int create_updaters()
             return -1;
         }
     }
-
+    
     for (int i = 0; i < UPDATERS_COUNT; i++)
     {
         int* tid = pj_pool_zalloc(media_session_pool, sizeof(int)); 

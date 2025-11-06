@@ -1,9 +1,10 @@
 #ifndef ANSWERPHONE_H
 #define ANSWERPHONE_H
 
-#define MAIN_POOL_SIZE 256
+#define MAIN_POOL_SIZE 512
 #define MEDIA_POOL_SIZE 512
 #define MEDIA_POOL_INC_SIZE 128
+#define TIMERS_POOL_SIZE (PJSUA_MAX_CALLS * sizeof(pj_timer_entry) * 2)
 
 #define UPDATERS_COUNT 3
 #define MAX_ANSWER_DURATION_SEC 2
