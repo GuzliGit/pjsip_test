@@ -70,7 +70,30 @@ static void cleanup_resources()
         pjsua_conf_remove_port(slots[i].conf_slot);
     }
 
-    pj_timer_heap_destroy(t_heap);
+    if (timers_pools[0])
+    {
+        pj_pool_release(timers_pools[0]);
+    }
+    if (timers_pools[1])
+    {
+        pj_pool_release(timers_pools[1]);
+    }
+    if (t_heap)
+    {
+        pj_timer_heap_destroy(t_heap);
+    }
+    if (media_session_pool)
+    {
+        pj_pool_release(media_session_pool);
+    }
+    if (main_pool)
+    {
+        pj_pool_release(main_pool);
+    }
+    if (&ch_pool)
+    {
+        pj_caching_pool_destroy(&ch_pool);
+    }
     pjsua_destroy();
 }
 
@@ -307,7 +330,7 @@ int init_answerphone()
 
     pjsua_logging_config_default(&log_cfg);
     log_cfg.msg_logging = PJ_TRUE;
-    log_cfg.console_level = 2;
+    log_cfg.console_level = 4;
 
     status = pjsua_init(&cfg, &log_cfg, &med_cfg);
     if (status != PJ_SUCCESS)
@@ -522,9 +545,8 @@ int start_answerphone(const char* sip_user, const char* sip_domain)
     {
         pj_timer_heap_poll(t_heap, NULL);
         pjsip_endpt_handle_events(pjsua_get_pjsip_endpt(), &delay);
-        PJ_LOG(1, (__FILE__, "==TIMERS POOL[1] SIZE: %ld==", pj_pool_get_used_size(timers_pools[0])));
-        PJ_LOG(1, (__FILE__, "==TIMERS POOL[2] SIZE: %ld==", pj_pool_get_used_size(timers_pools[1])));
-        pj_thread_sleep(10);
+        //PJ_LOG(1, (__FILE__, "==TIMERS POOL[1] SIZE: %ld==", pj_pool_get_used_size(timers_pools[0])));
+        //PJ_LOG(1, (__FILE__, "==TIMERS POOL[2] SIZE: %ld==", pj_pool_get_used_size(timers_pools[1])));
     }
 
     pjsua_call_hangup_all();
