@@ -18,6 +18,12 @@ typedef struct slot_info
     char is_enabled;
 } slot_info;
 
+typedef struct update_info
+{
+    pj_time_val call_timestamp;
+    pj_mutex_t* mutex;
+} update_info;
+
 static pj_caching_pool ch_pool;
 static pj_pool_t* main_pool;
 static pj_pool_t* media_session_pool;
@@ -34,9 +40,8 @@ static pjsua_acc_config acc_cfg;
 
 static slot_info* slots;
 
-static pj_time_val call_timestamp[PJSUA_MAX_CALLS];
-static pj_mutex_t* update_mut[UPDATERS_COUNT];
-static pj_thread_t* updaters[UPDATERS_COUNT];
+static pj_thread_t* updater;
+static update_info current_calls[PJSUA_MAX_CALLS];
 
 static volatile char is_cleanup = 0;
 static volatile char active_timers_pool = 0;
@@ -46,20 +51,14 @@ static int create_transport();
 static int create_pools();
 static int create_timer_heaps();
 static int add_account(const char*, const char*);
-static int create_updaters();
+static int create_updater();
 
 static void cleanup_resources()
 {
-    for (int i = 0; i < UPDATERS_COUNT; i++)
-    {   
-        if (updaters[i])
-        {
-            pj_thread_join(updaters[i]);
-            pj_thread_destroy(updaters[i]);
-        }
-
-        if (update_mut[i])
-            pj_mutex_destroy(update_mut[i]);
+    if (updater)
+    {
+        pj_thread_join(updater);
+        pj_thread_destroy(updater);
     }
 
     for (int i = 0; i < MODE_COUNT; i++)
@@ -306,21 +305,20 @@ static void on_call_state(pjsua_call_id call_id, pjsip_event* e)
     }
     
     pj_time_val cur_time = {-1, -1};
-    int thread_to_lock = call_id % UPDATERS_COUNT;
 
     if (call_info.state == PJSIP_INV_STATE_EARLY || call_info.state == PJSIP_INV_STATE_CONFIRMED)
     {
         pj_gettimeofday(&cur_time);
 
-        pj_mutex_lock(update_mut[thread_to_lock]);
-        call_timestamp[call_id] = cur_time;
-        pj_mutex_unlock(update_mut[thread_to_lock]);
+        pj_mutex_lock(current_calls[call_id].mutex);
+        current_calls[call_id].call_timestamp = cur_time;
+        pj_mutex_unlock(current_calls[call_id].mutex);
     }
     else if (call_info.state == PJSIP_INV_STATE_DISCONNECTED)
     {
-        pj_mutex_lock(update_mut[thread_to_lock]);
-        call_timestamp[call_id] = cur_time;
-        pj_mutex_unlock(update_mut[thread_to_lock]);
+        pj_mutex_lock(current_calls[call_id].mutex);
+        current_calls[call_id].call_timestamp = cur_time;
+        pj_mutex_unlock(current_calls[call_id].mutex);
     }
 }
 
@@ -351,34 +349,37 @@ int init_answerphone()
     if (status != PJ_SUCCESS)
     {
         PJ_LOG(1, (__FILE__, "==pjsua_init error=="));
-        cleanup_resources();
-        return -1;
+        goto _exit;
     }
 
     status = pjsua_set_null_snd_dev();
     if (status != PJ_SUCCESS)
     {
         PJ_LOG(1, (__FILE__, "==pjsua_set_null_snd_dev error=="));
-        cleanup_resources();
-        return -1;
+        goto _exit;
     }
-    if (create_transport() != PJ_SUCCESS)
+    status = create_transport();
+    if (status != PJ_SUCCESS)
     {
-        cleanup_resources();
-        return -1;
+        goto _exit;
     }
-    if (create_pools() != PJ_SUCCESS)
+    status = create_pools();
+    if (status != PJ_SUCCESS)
     {
-        cleanup_resources();
-        return -1;
+        goto _exit;
     }
-    if (create_timer_heaps() != PJ_SUCCESS)
+    status = create_timer_heaps();
+    if (status != PJ_SUCCESS)
     {
-        cleanup_resources();
-        return -1;
+        goto _exit;
     }
 
-    return PJ_SUCCESS;
+_exit:
+    if (status != PJ_SUCCESS)
+    {
+        cleanup_resources();
+    }
+    return status;
 }
 
 static int create_transport()
@@ -482,24 +483,23 @@ static int add_account(const char* sip_user, const char* sip_domain)
 
 static int update_calls_status(void* data)
 {
-    int tid = *(int*)data;
     pj_status_t status;
     pj_time_val result_time;
     
     while (!is_cleanup)
     {
-        for (int i = tid; i < PJSUA_MAX_CALLS; i+=UPDATERS_COUNT)
+        for (int i = 0; i < PJSUA_MAX_CALLS; i++)
         {
             pj_gettimeofday(&result_time);
             
-            pj_mutex_lock(update_mut[tid]);
-            if (call_timestamp[i].sec == -1)
+            pj_mutex_lock(current_calls[i].mutex);
+            if (current_calls[i].call_timestamp.sec == -1)
             {
-                pj_mutex_unlock(update_mut[tid]);
+                pj_mutex_unlock(current_calls[i].mutex);
                 continue;
             }
-            PJ_TIME_VAL_SUB(result_time, call_timestamp[i]);
-            pj_mutex_unlock(update_mut[tid]);
+            PJ_TIME_VAL_SUB(result_time, current_calls[i].call_timestamp);
+            pj_mutex_unlock(current_calls[i].mutex);
             
             if (result_time.sec >= MAX_ANSWER_DURATION_SEC)
             {
@@ -528,28 +528,23 @@ int start_answerphone(const char* sip_user, const char* sip_domain)
     if (status != PJ_SUCCESS)
     {
         PJ_LOG(1, (__FILE__, "==pjsua_start error=="));
-        cleanup_resources();
-        return -1;
+        goto _exit;
     }
-
     slots = pj_pool_zalloc(media_session_pool, sizeof(slot_info) * MODE_COUNT);
     if (!slots)
     {
         PJ_LOG(1, (__FILE__, "==pj_pool_zalloc error(slots)=="));
-        cleanup_resources();
-        return -1;
+        goto _exit;
     }
-
-    if (create_updaters() != PJ_SUCCESS)
+    status = create_updater();
+    if (status != PJ_SUCCESS)
     {
-        cleanup_resources();
-        return -1;
+        goto _exit;
     }
-
-    if (add_account(sip_user, sip_domain) != PJ_SUCCESS)
+    status = add_account(sip_user, sip_domain);
+    if (status != PJ_SUCCESS)
     {
-        cleanup_resources();
-        return -1;
+        goto _exit;
     }
 
     pj_time_val delay = {0, 10};
@@ -559,46 +554,33 @@ int start_answerphone(const char* sip_user, const char* sip_domain)
         pj_timer_heap_poll(t_heaps[1], NULL);
     }
 
+_exit:
     pjsua_call_hangup_all();
     cleanup_resources();
-    return PJ_SUCCESS;
+    return status;
 }
 
-static int create_updaters()
+static int create_updater()
 {
     pj_status_t status;
-    for (int i = 0; i < UPDATERS_COUNT; i++)
+    for (int i = 0; i < PJSUA_MAX_CALLS; i++)
     {
-        status = pj_mutex_create(media_session_pool, "upd_mut", PJ_MUTEX_DEFAULT, &update_mut[i]);
+        current_calls[i].call_timestamp.sec = -1;
+        current_calls[i].call_timestamp.msec = -1;
+
+        status = pj_mutex_create(media_session_pool, "upd_mut", PJ_MUTEX_DEFAULT, &current_calls[i].mutex);
         if (status != PJ_SUCCESS)
         {
             PJ_LOG(1, (__FILE__, "==pj_mutex_create error=="));
             return -1;
         }
     }
-    
-    for (int i = 0; i < UPDATERS_COUNT; i++)
-    {
-        int* tid = pj_pool_zalloc(media_session_pool, sizeof(int)); 
-        if (!tid)
-        {
-            PJ_LOG(1, (__FILE__, "==pj_pool_zalloc error(tid)=="));
-            return -1;
-        }
 
-        *tid = i;
-        status = pj_thread_create(media_session_pool, "updater", &update_calls_status, (void*)tid, PJ_THREAD_DEFAULT_STACK_SIZE, 0, &updaters[i]);
-        if (status != PJ_SUCCESS)
-        {
-            PJ_LOG(1, (__FILE__, "==pj_thread_create error(updater)=="));
-            return -1;
-        }
-    }
-
-    for (int i = 0; i < PJSUA_MAX_CALLS; i++)
+    status = pj_thread_create(media_session_pool, "updater", &update_calls_status, NULL, PJ_THREAD_DEFAULT_STACK_SIZE, 0, &updater);
+    if (status != PJ_SUCCESS)
     {
-        call_timestamp[i].sec = -1;
-        call_timestamp[i].msec = -1;
+        PJ_LOG(1, (__FILE__, "==pj_thread_create error(updater)=="));
+        return -1;
     }
 
     return status;

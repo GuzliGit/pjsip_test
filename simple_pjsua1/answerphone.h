@@ -6,8 +6,7 @@
 #define MEDIA_POOL_INC_SIZE 128
 #define TIMERS_POOL_SIZE (PJSUA_MAX_CALLS * sizeof(pj_timer_entry))
 
-#define UPDATERS_COUNT 3
-#define MAX_ANSWER_DURATION_SEC 2
+#define MAX_ANSWER_DURATION_SEC 5
 
 #define MAX_USERNAME_LEN 32
 #define MAX_DOMAIN_LEN 64
