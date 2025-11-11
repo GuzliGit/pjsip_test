@@ -21,7 +21,7 @@ typedef struct slot_info
 static pj_caching_pool ch_pool;
 static pj_pool_t* main_pool;
 static pj_pool_t* media_session_pool;
-static pj_timer_heap_t* t_heap;
+static pj_timer_heap_t* t_heaps[2];
 static pj_pool_t* timers_pools[2];
 
 static pjsua_acc_id acc_id;
@@ -44,7 +44,7 @@ static volatile char active_timers_pool = 0;
 static int enable_conf_slot(response_mode, const char*);
 static int create_transport();
 static int create_pools();
-static int create_timer_heap();
+static int create_timer_heaps();
 static int add_account(const char*, const char*);
 static int create_updaters();
 
@@ -78,9 +78,13 @@ static void cleanup_resources()
     {
         pj_pool_release(timers_pools[1]);
     }
-    if (t_heap)
+    if (t_heaps[0])
     {
-        pj_timer_heap_destroy(t_heap);
+        pj_timer_heap_destroy(t_heaps[0]);
+    }
+    if (t_heaps[1])
+    {
+        pj_timer_heap_destroy(t_heaps[1]);
     }
     if (media_session_pool)
     {
@@ -114,7 +118,7 @@ static void answer_timer_callback(pj_timer_heap_t* timer_heap, pj_timer_entry* e
         pjsua_call_hangup(call_id, 500, NULL, NULL);
         return;
     }
-    
+
     pjsua_call_info call_info;
     status = pjsua_call_get_info(call_id, &call_info);
     if (status != PJ_SUCCESS || call_info.state == PJSIP_INV_STATE_DISCONNECTED)
@@ -234,19 +238,30 @@ static void on_incoming_call(pjsua_acc_id acc_id, pjsua_call_id call_id, pjsip_r
     pj_status_t status;
     pjsua_call_info info;
     pj_time_val delay = {1, 0};
+    int past_heap;
 
     PJ_UNUSED_ARG(acc_id);
     PJ_UNUSED_ARG(rdata);
 
-    if (pj_pool_get_used_size(timers_pools[active_timers_pool]) >= TIMERS_POOL_SIZE * 0.9)
+    if (pj_pool_get_used_size(timers_pools[active_timers_pool]) >= TIMERS_POOL_SIZE)
     {
-        active_timers_pool = active_timers_pool == 0 ? 1 : 0; 
-        pj_pool_reset(timers_pools[active_timers_pool]);
+        past_heap = active_timers_pool == 0 ? 1 : 0;
+        if (pj_timer_heap_count(t_heaps[past_heap]) == 0)
+        {
+            active_timers_pool = past_heap;
+            pj_pool_reset(timers_pools[active_timers_pool]);
+        }
+        else
+        {
+            pjsua_call_hangup(call_id, 486, NULL, NULL);            
+            return;
+        }
     }
 
     status = pjsua_call_get_info(call_id, &info);
     if (status != PJ_SUCCESS)
     {
+        PJ_LOG(1, (__FILE__, "==pjsua_call_get_info error=="));
         pjsua_call_hangup(call_id, 486, NULL, NULL);
         return;
     }
@@ -269,7 +284,7 @@ static void on_incoming_call(pjsua_acc_id acc_id, pjsua_call_id call_id, pjsip_r
     
     pj_timer_entry_init(timer, PJSUA_INVALID_ID, (void*)(long)call_id, &answer_timer_callback);
     
-    status = pj_timer_heap_schedule(t_heap, timer, &delay);
+    status = pj_timer_heap_schedule(t_heaps[active_timers_pool], timer, &delay);
     if (status != PJ_SUCCESS)
     {
         pjsua_call_hangup(call_id, 500, NULL, NULL);
@@ -330,46 +345,36 @@ int init_answerphone()
 
     pjsua_logging_config_default(&log_cfg);
     log_cfg.msg_logging = PJ_TRUE;
-    log_cfg.console_level = 4;
+    log_cfg.console_level = 2;
 
     status = pjsua_init(&cfg, &log_cfg, &med_cfg);
     if (status != PJ_SUCCESS)
     {
         PJ_LOG(1, (__FILE__, "==pjsua_init error=="));
-        pjsua_destroy();
+        cleanup_resources();
         return -1;
     }
 
-    PJ_LOG(1, (__FILE__, "==max_conf_ports=%d==", pjsua_conf_get_max_ports()));
     status = pjsua_set_null_snd_dev();
     if (status != PJ_SUCCESS)
     {
         PJ_LOG(1, (__FILE__, "==pjsua_set_null_snd_dev error=="));
-        pjsua_destroy();
+        cleanup_resources();
         return -1;
     }
-
     if (create_transport() != PJ_SUCCESS)
     {
-        pjsua_destroy();
+        cleanup_resources();
         return -1;
     }
-
     if (create_pools() != PJ_SUCCESS)
     {
-        pj_caching_pool_destroy(&ch_pool);
-        pjsua_destroy();
+        cleanup_resources();
         return -1;
     }
-
-    if (create_timer_heap() != PJ_SUCCESS)
+    if (create_timer_heaps() != PJ_SUCCESS)
     {
-        pj_pool_release(timers_pools[0]);
-        pj_pool_release(timers_pools[1]);
-        pj_pool_release(media_session_pool);
-        pj_pool_release(main_pool);
-        pj_caching_pool_destroy(&ch_pool);
-        pjsua_destroy();
+        cleanup_resources();
         return -1;
     }
 
@@ -425,12 +430,19 @@ static int create_pools()
     return PJ_SUCCESS;
 }
 
-static int create_timer_heap()
+static int create_timer_heaps()
 {
-    pj_status_t status = pj_timer_heap_create(main_pool, PJSUA_MAX_CALLS, &t_heap);
+    pj_status_t status = pj_timer_heap_create(main_pool, PJSUA_MAX_CALLS, &t_heaps[0]);
     if (status != PJ_SUCCESS)
     {
-        PJ_LOG(1, (__FILE__, "==pj_timer_heap_create error=="));
+        PJ_LOG(1, (__FILE__, "==pj_timer_heap_create error[0]=="));
+        return -1;
+    }
+    
+    status = pj_timer_heap_create(main_pool, PJSUA_MAX_CALLS, &t_heaps[1]);
+    if (status != PJ_SUCCESS)
+    {
+        PJ_LOG(1, (__FILE__, "==pj_timer_heap_create error[1]=="));
     }
 
     return status;
@@ -473,7 +485,7 @@ static int update_calls_status(void* data)
     int tid = *(int*)data;
     pj_status_t status;
     pj_time_val result_time;
-
+    
     while (!is_cleanup)
     {
         for (int i = tid; i < PJSUA_MAX_CALLS; i+=UPDATERS_COUNT)
@@ -511,7 +523,7 @@ int start_answerphone(const char* sip_user, const char* sip_domain)
     {
         return -1;
     }
-
+    
     status = pjsua_start();
     if (status != PJ_SUCCESS)
     {
@@ -543,10 +555,8 @@ int start_answerphone(const char* sip_user, const char* sip_domain)
     pj_time_val delay = {0, 10};
     while (!is_cleanup)
     {
-        pj_timer_heap_poll(t_heap, NULL);
-        pjsip_endpt_handle_events(pjsua_get_pjsip_endpt(), &delay);
-        //PJ_LOG(1, (__FILE__, "==TIMERS POOL[1] SIZE: %ld==", pj_pool_get_used_size(timers_pools[0])));
-        //PJ_LOG(1, (__FILE__, "==TIMERS POOL[2] SIZE: %ld==", pj_pool_get_used_size(timers_pools[1])));
+        pj_timer_heap_poll(t_heaps[0], NULL);
+        pj_timer_heap_poll(t_heaps[1], NULL);
     }
 
     pjsua_call_hangup_all();
