@@ -9,12 +9,15 @@ static pjsip_transport* in_transport;
 static pjsip_transport* out_transport;
 static pjsip_inv_session* cur_inv;
 
-static pjsip_module mod_minisbc;
+static pj_sockaddr* in_addr;
+static pj_sockaddr* out_addr;
+
+static pjsip_module mod_minisbc_uas;
 static volatile char is_end = 0;
 
 
 static pj_status_t create_endpoint();
-static pj_status_t create_transport(pj_sockaddr*, pj_sockaddr*);
+static pj_status_t create_transport();
 static pj_status_t init_modules();
 static void create_sbc_module();
 
@@ -47,9 +50,12 @@ void sig_handler()
     is_end = 1;
 }
 
-int start_sbc(pj_sockaddr* in_addr, pj_sockaddr* out_addr)
+int start_sbc(pj_sockaddr* inner_addr, pj_sockaddr* outer_addr)
 {
     pj_status_t status = -1;
+    in_addr = inner_addr;
+    out_addr = outer_addr;
+
     status = pj_init();
     if (status != PJ_SUCCESS)
     {
@@ -102,7 +108,7 @@ static pj_status_t create_endpoint()
     return status;
 }
 
-static pj_status_t create_transport(pj_sockaddr* in_addr, pj_sockaddr* out_addr)
+static pj_status_t create_transport()
 {
     pj_status_t status;
     status = pjsip_udp_transport_start(sbc_endpt, &in_addr->ipv4, NULL, 1, &in_transport);
@@ -157,7 +163,7 @@ static pj_status_t init_modules()
     }
 
     create_sbc_module();
-    status = pjsip_endpt_register_module(sbc_endpt, &mod_minisbc);
+    status = pjsip_endpt_register_module(sbc_endpt, &mod_minisbc_uas);
     if (status != PJ_SUCCESS)
     {
         PJ_LOG(2, (__FILE__, "pjsip_endpt_register_module [miniSBC] error"));
@@ -168,20 +174,20 @@ static pj_status_t init_modules()
 
 static void create_sbc_module()
 {
-    mod_minisbc.prev = NULL;
-    mod_minisbc.next = NULL;
-    mod_minisbc.name = pj_str("mod-miniSBC");
-    mod_minisbc.id = -1;
-    mod_minisbc.priority = PJSIP_MOD_PRIORITY_APPLICATION;
-    mod_minisbc.start = NULL;
-    mod_minisbc.load = NULL;
-    mod_minisbc.stop = NULL;
-    mod_minisbc.unload = NULL;
-    mod_minisbc.on_rx_request = &on_rx_request;
-    mod_minisbc.on_rx_response = NULL;
-    mod_minisbc.on_tsx_state = NULL;
-    mod_minisbc.on_tx_request = NULL;
-    mod_minisbc.on_tx_response = NULL;
+    mod_minisbc_uas.prev = NULL;
+    mod_minisbc_uas.next = NULL;
+    mod_minisbc_uas.name = pj_str("mod-miniSBC");
+    mod_minisbc_uas.id = -1;
+    mod_minisbc_uas.priority = PJSIP_MOD_PRIORITY_APPLICATION;
+    mod_minisbc_uas.start = NULL;
+    mod_minisbc_uas.load = NULL;
+    mod_minisbc_uas.stop = NULL;
+    mod_minisbc_uas.unload = NULL;
+    mod_minisbc_uas.on_rx_request = &on_rx_request;
+    mod_minisbc_uas.on_rx_response = NULL;
+    mod_minisbc_uas.on_tsx_state = NULL;
+    mod_minisbc_uas.on_tx_request = NULL;
+    mod_minisbc_uas.on_tx_response = NULL;
 }
 
 
@@ -201,6 +207,12 @@ static void call_on_state_changed(pjsip_inv_session* inv, pjsip_event* e)
 
 static pj_bool_t on_rx_request(pjsip_rx_data* rdata)
 {
+    if (rdata->tp_info.transport != in_transport)
+    {
+        return PJ_FALSE;
+    }
+    
+    PJ_LOG(2, (__FILE__, "[INNER TRANSPORT] request from %s:%d is being processed", pj_inet_ntoa(rdata->pkt_info.src_addr.ipv4.sin_addr), rdata->pkt_info.src_port));
     pjsip_method_e method = rdata->msg_info.msg->line.req.method.id;
     if (method != PJSIP_INVITE_METHOD && method != PJSIP_ACK_METHOD)
     {
@@ -225,5 +237,31 @@ static pj_bool_t on_rx_request(pjsip_rx_data* rdata)
         return PJ_TRUE;
     }
 
-    ////
+    pjsip_dialog* dlg;
+    status = pjsip_dlg_create_uas_and_inc_lock(pjsip_ua_instance(), rdata, NULL, &dlg);
+    if (status != PJ_SUCCESS)
+    {
+        pj_str_t st_text = pj_str("Can't create UAS dialog");
+        pjsip_endpt_respond_stateless(sbc_endpt, rdata, 500, &st_text, NULL, NULL);
+        return PJ_TRUE;
+    }
+
+    status = pjsip_inv_create_uas(dlg, rdata, NULL, 0, &cur_inv);
+    pjsip_dlg_dec_lock(dlg);
+    if (status != PJ_SUCCESS)
+    {
+        return PJ_TRUE;
+    }
+
+    pjsip_tx_data* tdata;
+    pjsip_inv_initial_answer(cur_inv, rdata, 180, NULL, NULL, &tdata);
+    pjsip_inv_send_msg(cur_inv, tdata);
+
+    pj_thread_sleep(4000);
+
+    pjsip_inv_end_session(cur_inv, 200, NULL, &tdata);
+    pjsip_inv_send_msg(cur_inv, tdata);
+    cur_inv = NULL;
+
+    return PJ_TRUE;
 }
