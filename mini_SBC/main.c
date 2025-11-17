@@ -7,7 +7,7 @@ int main(int argc, char* argv[])
 {
     if (argc != 3)
     {
-        printf("USAGE: ./miniSBC <internal_addr> <outer_addr>\n");
+        printf("USAGE: ./miniSBC <inner_addr> <outer_addr>\n");
         return -1;
     }
     if (strlen(argv[1]) > MAX_ADDR_LEN || strlen(argv[2]) > MAX_ADDR_LEN)
@@ -22,7 +22,7 @@ int main(int argc, char* argv[])
     pj_str_t inaddr_str = pj_str(argv[1]);
     if (pj_sockaddr_parse(PJ_AF_INET, 0, &inaddr_str, in_addr) != PJ_SUCCESS)
     {
-        printf("CAN'T PARSE INTERNAL ADDRESS\n");
+        printf("CAN'T PARSE INNER ADDRESS\n");
         goto error;
     }
     pj_str_t outaddr_str = pj_str(argv[2]);
