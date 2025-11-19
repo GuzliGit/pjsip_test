@@ -1,4 +1,5 @@
 #include "miniSBC.h"
+#include "registartor.h"
 #include <signal.h>
 #include <pjsip.h>
 #include <pjsip_ua.h>
@@ -18,7 +19,8 @@ static pjsip_transport* out_transport;
 static pjmedia_transport* out_med_transport;
 static pjmedia_transport_info out_med_tpinfo;
 static pjmedia_sock_info out_med_sockinfo;
-static pjsip_inv_session* cur_inv;
+static pjsip_inv_session* uas_inv;
+static pjsip_inv_session* uac_inv;
 
 static pj_sockaddr* in_addr;
 static pj_sockaddr* out_addr;
@@ -36,6 +38,7 @@ static pj_status_t create_pools();
 
 static void call_on_state_changed(pjsip_inv_session*, pjsip_event*);
 static pj_bool_t on_rx_request(pjsip_rx_data*);
+static pj_bool_t on_rx_response(pjsip_rx_data*);
 
 void cleanup()
 {
@@ -55,6 +58,9 @@ void cleanup()
     {
         pjmedia_transport_close(out_med_transport);
     }
+
+    registrator_destroy();
+    
     if (med_endpt)
     {
         pjmedia_endpt_destroy(med_endpt);
@@ -101,6 +107,11 @@ int start_sbc(pj_sockaddr* inner_addr, pj_sockaddr* outer_addr)
         goto _exit;
     }
     status = init_modules();
+    if (status != PJ_SUCCESS)
+    {
+        goto _exit;
+    }
+    status = registrator_init(&ch_pool.factory);
     if (status != PJ_SUCCESS)
     {
         goto _exit;
@@ -261,7 +272,7 @@ static void create_sbc_module()
     mod_minisbc.stop = NULL;
     mod_minisbc.unload = NULL;
     mod_minisbc.on_rx_request = &on_rx_request;
-    mod_minisbc.on_rx_response = NULL;
+    mod_minisbc.on_rx_response = &on_rx_response;
     mod_minisbc.on_tsx_state = NULL;
     mod_minisbc.on_tx_request = NULL;
     mod_minisbc.on_tx_response = NULL;
@@ -286,13 +297,12 @@ static void call_on_state_changed(pjsip_inv_session* inv, pjsip_event* e)
     PJ_UNUSED_ARG(e);
     if (inv->state == PJSIP_INV_STATE_DISCONNECTED)
     {
-        PJ_LOG(2, (__FILE__, "Call disconnected | reason=%d [%s]", inv->cause, inv->cause_text.ptr));
+        PJ_LOG(2, (__FILE__, "Call disconnected | reason=%d [%.*s]", inv->cause, (int)inv->cause_text.slen, inv->cause_text.ptr));
         //// Need to add correct end of dialog
-        cur_inv == NULL;
     }
     else if (inv->state == PJSIP_INV_STATE_CONFIRMED)
     {
-        is_in_connection_established = (inv == cur_inv) ? 1 : is_in_connection_established;
+        is_in_connection_established = (inv == uas_inv) ? 1 : is_in_connection_established;
     }
     else
     {
@@ -302,9 +312,21 @@ static void call_on_state_changed(pjsip_inv_session* inv, pjsip_event* e)
 
 static pj_bool_t on_rx_request(pjsip_rx_data* rdata)
 {
-    PJ_LOG(2, (__FILE__, "[TRANSPORT] request from %s:%d is being processed", pj_inet_ntoa(rdata->pkt_info.src_addr.ipv4.sin_addr), rdata->pkt_info.src_port));
     pjsip_method_e method = rdata->msg_info.msg->line.req.method.id;
-    if (method != PJSIP_INVITE_METHOD)
+    if (method == PJSIP_REGISTER_METHOD)
+    {
+        // pjsip_authorization_hdr* hdr = pjsip_msg_find_hdr(rdata->msg_info.msg, PJSIP_H_AUTHORIZATION, NULL);
+        // if (!hdr)
+        // {
+        //     if (try_register(sbc_endpt, rdata) == PJ_SUCCESS)
+        //     {
+        //         try_auth(sbc_endpt, rdata);
+        //     }
+        // }
+
+        return PJ_TRUE;
+    }
+    else if (method != PJSIP_INVITE_METHOD)
     {
         pj_str_t st_text = pj_str("SBC can't handle such request");
         pjsip_endpt_respond_stateless(sbc_endpt, rdata, 500, &st_text, NULL, NULL);
@@ -312,12 +334,13 @@ static pj_bool_t on_rx_request(pjsip_rx_data* rdata)
     }
 
     //// Sync
-    if (cur_inv)
+    if (uas_inv)
     {
         pj_str_t st_text = pj_str("Another call is in progress");
         pjsip_endpt_respond_stateless(sbc_endpt, rdata, 486, &st_text, NULL, NULL);
         return PJ_TRUE;
     }
+    PJ_LOG(2, (__FILE__, "[TRANSPORT] request from %s:%d is being processed", pj_inet_ntoa(rdata->pkt_info.src_addr.ipv4.sin_addr), rdata->pkt_info.src_port));
 
     unsigned int options = 0;
     pj_status_t status = pjsip_inv_verify_request(rdata, &options, NULL, NULL, sbc_endpt, NULL);
@@ -328,8 +351,8 @@ static pj_bool_t on_rx_request(pjsip_rx_data* rdata)
         return PJ_TRUE;
     }
 
-    pjsip_dialog* dlg;
-    status = pjsip_dlg_create_uas_and_inc_lock(pjsip_ua_instance(), rdata, NULL, &dlg);
+    pjsip_dialog* uas_dlg;
+    status = pjsip_dlg_create_uas_and_inc_lock(pjsip_ua_instance(), rdata, NULL, &uas_dlg);
     if (status != PJ_SUCCESS)
     {
         pj_str_t st_text = pj_str("Can't create UAS dialog");
@@ -342,27 +365,48 @@ static pj_bool_t on_rx_request(pjsip_rx_data* rdata)
     status = pjmedia_endpt_create_sdp(med_endpt, rdata->tp_info.pool, 1, cur_sock_info, &local_sdp);
     if (status != PJ_SUCCESS)
     {
-        pjsip_dlg_dec_lock(dlg);
+        pjsip_dlg_dec_lock(uas_dlg);
         return PJ_TRUE;
     }
 
-    status = pjsip_inv_create_uas(dlg, rdata, local_sdp, 0, &cur_inv);
-    pjsip_dlg_dec_lock(dlg);
+    status = pjsip_inv_create_uas(uas_dlg, rdata, local_sdp, 0, &uas_inv);
+    pjsip_dlg_dec_lock(uas_dlg);
     if (status != PJ_SUCCESS)
     {
         return PJ_TRUE;
     }
 
     pjsip_tx_data* tdata;
-    pjsip_inv_initial_answer(cur_inv, rdata, 180, NULL, NULL, &tdata);
-    pjsip_inv_send_msg(cur_inv, tdata);
-    pj_bzero(tdata, sizeof(tdata));
+    pjsip_inv_initial_answer(uas_inv, rdata, 180, NULL, NULL, &tdata);
+    pjsip_inv_send_msg(uas_inv, tdata);
 
     //// Establish connection with other side
+    pjsip_dialog* uac_dlg;
+    char local_uri[64], remote_uri[64];
+    snprintf(local_uri, 64, "sip:sbc@%s", pj_inet_ntoa(rdata->tp_info.transport->local_addr.ipv4.sin_addr));
+    pjsip_uri_print(PJSIP_URI_IN_REQ_URI, rdata->msg_info.msg->line.req.uri, remote_uri, 64);
+    pj_str_t loc = pj_str(local_uri);
+    pj_str_t rem = pj_str(remote_uri);
+    status = pjsip_dlg_create_uac(pjsip_ua_instance(), &loc, NULL, &rem, NULL, &uac_dlg);
+    if (status != PJ_SUCCESS)
+    {
+        pj_str_t st_text = pj_str("Can't create UAC dialog");
+        pjsip_inv_end_session(uas_inv, 500, &st_text, &tdata);
+        return PJ_TRUE;
+    }
 
-    pjsip_inv_answer(cur_inv, 200, NULL, NULL, &tdata);
-    pjsip_inv_send_msg(cur_inv, tdata);
-    pj_bzero(tdata, sizeof(tdata));
+    status = pjsip_inv_create_uac(uac_dlg, local_sdp, 0, &uac_inv);
+    pjsip_inv_invite(uac_inv, &tdata);
+    pjsip_inv_send_msg(uac_inv, tdata);
+
+    pjsip_inv_end_session(uas_inv, 500, NULL, &tdata);
+    pjsip_inv_send_msg(uas_inv, tdata);
+
+    return PJ_TRUE;
+}
+
+static pj_bool_t on_rx_response(pjsip_rx_data *rdata)
+{
 
     return PJ_TRUE;
 }

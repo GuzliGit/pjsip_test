@@ -6,6 +6,7 @@
 #define MEDIA_POOL_SIZE 512
 
 #define MAX_ADDR_LEN 32
+
 #define ENDPOINT_NAME "siptest"
 #define RTP_PORT 5000
 

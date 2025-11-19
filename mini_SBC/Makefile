@@ -9,7 +9,7 @@ CFLAGS = $(shell pkg-config --cflags --libs libpjproject) -fsanitize=address
 TARGET_x86_64 = $(BIN_DIR)/miniSBC
 TARGET_ARM64 = $(BIN_DIR)/miniSBC-arm
 
-SRC = main.c miniSBC.c
+SRC = main.c miniSBC.c registrator.c
 OBJS_x86_64 = $(patsubst %.c, $(OBJ_DIR)/%-x86_64.o, $(SRC))
 OBJS_ARM64 = $(patsubst %.c, $(OBJ_DIR)/%-arm64.o, $(SRC))
 
