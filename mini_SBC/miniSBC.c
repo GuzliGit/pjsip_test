@@ -9,7 +9,6 @@ static pjsip_endpoint* sbc_endpt;
 static pjmedia_endpt* med_endpt;
 
 static pj_caching_pool ch_pool;
-static pj_pool_t* in_media_pool;
 
 static pjsip_transport* in_transport;
 static pjmedia_transport* in_med_transport;
@@ -34,7 +33,7 @@ static pj_status_t create_endpoint();
 static pj_status_t create_transport();
 static pj_status_t init_modules();
 static void create_sbc_module();
-static pj_status_t create_pools();
+static pj_status_t create_registrator();
 
 static void call_on_state_changed(pjsip_inv_session*, pjsip_event*);
 static pj_bool_t on_rx_request(pjsip_rx_data*);
@@ -111,7 +110,7 @@ int start_sbc(pj_sockaddr* inner_addr, pj_sockaddr* outer_addr)
     {
         goto _exit;
     }
-    status = registrator_init(&ch_pool.factory);
+    status = create_registrator();
     if (status != PJ_SUCCESS)
     {
         goto _exit;
@@ -278,14 +277,41 @@ static void create_sbc_module()
     mod_minisbc.on_tx_response = NULL;
 }
 
-static pj_status_t create_pools()
+static pj_status_t create_registrator()
 {
-    in_media_pool = pjmedia_endpt_create_pool(med_endpt, "Inner media pool", MEDIA_POOL_SIZE, MEDIA_POOL_SIZE);
-    if (!in_media_pool)
+    pj_status_t status;
+    status = registrator_init(&ch_pool.factory);
+    if (status != PJ_SUCCESS)
     {
-        PJ_LOG(2, (__FILE__, "pjmedia_endpt_create_pool error"));
-        return -1;
+        PJ_LOG(2, (__FILE__, "Registrator init error"));
+        return status;
     }
+    
+    pj_str_t name = pj_str("tester");
+    pj_str_t addr_str = pj_str("127.0.0.1");
+    pj_in_addr addr;
+    pj_inet_aton(&addr_str, &addr);
+    pj_uint16_t port = 5063;
+    pj_str_t password = pj_str(DEFAULT_PASS);
+
+    status = add_contact(&name, &addr, port, &password);
+    if (status != PJ_SUCCESS)
+    {
+        PJ_LOG(2, (__FILE__, "Can't add equal contacts to registrator"));
+    }
+
+    name = pj_str("user1");
+    addr_str = pj_str("127.0.0.2");
+    pj_inet_aton(&addr_str, &addr);
+    port = 5063;
+    password = pj_str(DEFAULT_PASS);
+
+    status = add_contact(&name, &addr, port, &password);
+    if (status != PJ_SUCCESS)
+    {
+        PJ_LOG(2, (__FILE__, "Can't add equal contacts to registrator"));
+    }
+
 
     return PJ_SUCCESS;
 }
@@ -315,16 +341,17 @@ static pj_bool_t on_rx_request(pjsip_rx_data* rdata)
     pjsip_method_e method = rdata->msg_info.msg->line.req.method.id;
     if (method == PJSIP_REGISTER_METHOD)
     {
-        // pjsip_authorization_hdr* hdr = pjsip_msg_find_hdr(rdata->msg_info.msg, PJSIP_H_AUTHORIZATION, NULL);
-        // if (!hdr)
-        // {
-        //     if (try_register(sbc_endpt, rdata) == PJ_SUCCESS)
-        //     {
-        //         try_auth(sbc_endpt, rdata);
-        //     }
-        // }
-
-        return PJ_TRUE;
+        pjsip_authorization_hdr* hdr = pjsip_msg_find_hdr(rdata->msg_info.msg, PJSIP_H_AUTHORIZATION, NULL);
+        if (!hdr)
+        {
+            try_register(sbc_endpt, rdata);
+            return PJ_TRUE;
+        }
+        else
+        {
+            try_auth(sbc_endpt, rdata);
+            return PJ_TRUE;
+        }
     }
     else if (method != PJSIP_INVITE_METHOD)
     {

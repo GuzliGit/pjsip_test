@@ -15,11 +15,16 @@ typedef struct contact_info
     pj_in_addr addr;
     pj_uint16_t port;
     pj_str_t password;
-    pj_bool_t is_active;
+    pj_bool_t is_active_reg;
+    pj_time_val reg_timestamp;
+    pj_uint32_t lifetime;
+    pj_uint32_t expires;
 } contact_info;
 
 
 pj_status_t registrator_init(pj_pool_factory*);
+
+pj_status_t add_contact(pj_str_t*, pj_in_addr*, pj_uint16_t, pj_str_t*);
 
 pj_status_t try_register(pjsip_endpoint*, pjsip_rx_data*);
 
