@@ -30,6 +30,8 @@ pj_status_t try_register(pjsip_endpoint*, pjsip_rx_data*);
 
 pj_status_t try_auth(pjsip_endpoint*, pjsip_rx_data*);
 
+pj_status_t get_info_by_name(pj_str_t, pj_in_addr*, pj_uint16_t*);
+
 void registrator_destroy();
 
 #endif

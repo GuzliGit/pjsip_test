@@ -92,7 +92,7 @@ pj_status_t try_register(pjsip_endpoint* endpt, pjsip_rx_data* rdata)
         pjsip_contact_hdr* con_hdr = pjsip_msg_find_hdr(rdata->msg_info.msg, PJSIP_H_CONTACT, NULL);
         
         char uri_buf[128];
-        pj_ansi_snprintf(uri_buf, 64, "sip:%.*s@%s:%d", (int) contact->name.slen, contact->name.ptr, pj_inet_ntoa(contact->addr), contact->port);
+        pj_ansi_snprintf(uri_buf, 128, "sip:%.*s@%s:%d", (int) contact->name.slen, contact->name.ptr, pj_inet_ntoa(contact->addr), contact->port);
         if (!con_hdr)
         {
             con_hdr = pjsip_contact_hdr_create(tdata->pool);
@@ -254,6 +254,20 @@ _exit:
     contact->is_active_reg = PJ_FALSE;
     pj_mutex_unlock(contacts_mut);
     return status;
+}
+
+pj_status_t get_info_by_name(pj_str_t user, pj_in_addr* addr, pj_uint16_t* port)
+{
+    contact_info* info = get_contact(&user);
+    if (!info)
+    {
+        PJ_LOG(2, (__FILE__, "Can't find info about contact with such name"));
+        return -1;
+    }
+
+    *addr = info->addr;
+    *port = info->port;
+    return PJ_SUCCESS;
 }
 
 void registrator_destroy()
