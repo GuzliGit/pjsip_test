@@ -5,7 +5,7 @@
 
 #define REALM "sbc.local"
 #define DEFAULT_PASS "passwd"
-#define MAX_EXPECTED_CONTACTS 100
+#define MAX_EXPECTED_CONTACTS 10
 
 #define CONTACTS_POOL_SIZE 256
 

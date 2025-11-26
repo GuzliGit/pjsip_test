@@ -42,6 +42,7 @@ static pj_status_t initialize_media_bridge();
 
 static void call_on_state_changed(pjsip_inv_session*, pjsip_event*);
 static pj_bool_t on_rx_request(pjsip_rx_data*);
+static pj_bool_t on_rx_response(pjsip_rx_data*);
 // static void rtp_callback(void*, void*, pj_ssize_t);
 // static void rtcp_callback(void*, void*, pj_ssize_t);
 
@@ -271,13 +272,13 @@ static void create_sbc_module()
     mod_minisbc.next = NULL;
     mod_minisbc.name = pj_str("mod-miniSBC");
     mod_minisbc.id = -1;
-    mod_minisbc.priority = PJSIP_MOD_PRIORITY_APPLICATION;
+    mod_minisbc.priority = PJSIP_MOD_PRIORITY_TRANSPORT_LAYER + 1;
     mod_minisbc.start = NULL;
     mod_minisbc.load = NULL;
     mod_minisbc.stop = NULL;
     mod_minisbc.unload = NULL;
     mod_minisbc.on_rx_request = &on_rx_request;
-    mod_minisbc.on_rx_response = NULL;
+    mod_minisbc.on_rx_response = &on_rx_response;
     mod_minisbc.on_tsx_state = NULL;
     mod_minisbc.on_tx_request = NULL;
     mod_minisbc.on_tx_response = NULL;
@@ -465,6 +466,13 @@ static void call_on_state_changed(pjsip_inv_session* inv, pjsip_event* e)
 
 static pj_bool_t on_rx_request(pjsip_rx_data* rdata)
 {
+    PJ_LOG(2,(__FILE__, "== REQUEST %d bytes %s from %s %s:%d ==",
+                         rdata->msg_info.len,
+                         pjsip_rx_data_get_info(rdata),
+                         rdata->tp_info.transport->type_name,
+                         rdata->pkt_info.src_name,
+                         rdata->pkt_info.src_port));
+
     pjsip_method_e method = rdata->msg_info.msg->line.req.method.id;
     if (method == PJSIP_REGISTER_METHOD)
     {
@@ -472,12 +480,12 @@ static pj_bool_t on_rx_request(pjsip_rx_data* rdata)
         if (!hdr)
         {
             try_register(sbc_endpt, rdata);
-            return PJ_TRUE;
+            return PJ_FALSE;
         }
         else
         {
             try_auth(sbc_endpt, rdata);
-            return PJ_TRUE;
+            return PJ_FALSE;
         }
     }
     else if (method != PJSIP_INVITE_METHOD)
@@ -489,7 +497,7 @@ static pj_bool_t on_rx_request(pjsip_rx_data* rdata)
     {
         pj_str_t st_text = pj_str("Another call is in progress");
         pjsip_endpt_respond_stateless(sbc_endpt, rdata, 486, &st_text, NULL, NULL);
-        return PJ_TRUE;
+        return PJ_FALSE;
     }
     PJ_LOG(2, (__FILE__, "[TRANSPORT] request from %s:%d is being processed", pj_inet_ntoa(rdata->pkt_info.src_addr.ipv4.sin_addr), rdata->pkt_info.src_port));
 
@@ -499,17 +507,17 @@ static pj_bool_t on_rx_request(pjsip_rx_data* rdata)
     {
         pj_str_t st_text = pj_str("Can't verify this invite");
         pjsip_endpt_respond_stateless(sbc_endpt, rdata, 500, &st_text, NULL, NULL);
-        return PJ_TRUE;
+        return PJ_FALSE;
     }
 
     pjmedia_sdp_session* local_sdp;
     if (start_uas_dlg(rdata, &local_sdp) != PJ_SUCCESS)
     {
-        return PJ_TRUE;
+        return PJ_FALSE;
     }
 
     pjsip_tx_data* tdata;
-    status = pjsip_inv_initial_answer(uas_inv, rdata, 180, NULL, NULL, &tdata);
+    status = pjsip_inv_initial_answer(uas_inv, rdata, 100, NULL, NULL, &tdata);
     if (status != PJ_SUCCESS)
     {
         goto clean_uas;
@@ -524,7 +532,7 @@ static pj_bool_t on_rx_request(pjsip_rx_data* rdata)
     switch (start_uac_dlg(rdata, tdata, local_sdp))
     {
     case -1:
-        return PJ_TRUE;
+        return PJ_FALSE;
     
     case -2:
         goto clean_uas;
@@ -538,31 +546,106 @@ static pj_bool_t on_rx_request(pjsip_rx_data* rdata)
         break;
     }
 
-    status = pjsip_inv_answer(uas_inv, 200, NULL, NULL, &tdata);
-    if (status != PJ_SUCCESS)
-    {
-        goto clean_uac_and_uas;
-    }
+    // wait until connection established with other side
+    // status = pjsip_inv_answer(uas_inv, 200, NULL, NULL, &tdata);
+    // if (status != PJ_SUCCESS)
+    // {
+    //     goto clean_uac_and_uas;
+    // }
 
-    status = pjsip_inv_send_msg(uas_inv, tdata);
-    if (status != PJ_SUCCESS)
-    {
-        goto clean_uac_and_uas;
-    }
+    // status = pjsip_inv_send_msg(uas_inv, tdata);
+    // if (status != PJ_SUCCESS)
+    // {
+    //     goto clean_uac_and_uas;
+    // }
 
-    return PJ_TRUE;
+    return PJ_FALSE;
 
 clean_uas:
     pjsip_inv_end_session(uas_inv, 500, NULL, &tdata);
     pjsip_inv_send_msg(uas_inv, tdata);
-    return PJ_TRUE;
+    return PJ_FALSE;
 
 clean_uac_and_uas:
     pjsip_inv_end_session(uas_inv, 500, NULL, &tdata);
     pjsip_inv_send_msg(uas_inv, tdata);
     pjsip_inv_end_session(uac_inv, 500, NULL, &tdata);
     pjsip_inv_send_msg(uac_inv, tdata);
-    return PJ_TRUE;
+    return PJ_FALSE;
+}
+
+static pj_bool_t on_rx_response(pjsip_rx_data* rdata)
+{
+    PJ_LOG(2,(__FILE__, "== RESPONSE %d bytes %s from %s %s:%d ==\n %.*s\n == end of msg ==",
+                         rdata->msg_info.len,
+                         pjsip_rx_data_get_info(rdata),
+                         rdata->tp_info.transport->type_name,
+                         rdata->pkt_info.src_name,
+                         rdata->pkt_info.src_port,
+                         (int)rdata->msg_info.len,
+                         rdata->msg_info.msg_buf));
+
+    pj_status_t status;
+    if (uas_inv && uac_inv)
+    {
+        pjsip_tx_data* tdata;
+
+        status = pjsip_endpt_create_tdata(sbc_endpt, &tdata);
+        tdata->msg = pjsip_msg_clone(tdata->pool, rdata->msg_info.msg);
+
+        pjsip_via_hdr* via = (pjsip_via_hdr*) pjsip_msg_find_hdr(tdata->msg, PJSIP_H_VIA, NULL);
+        if (via)
+        {
+            pj_list_erase(via);
+        }
+
+        pjsip_transport* send_transport = (rdata->tp_info.transport == in_transport) ? out_transport : in_transport;
+        pj_sockaddr* send_addr = (send_transport == in_transport) ? out_addr : in_addr;
+        via = pjsip_via_hdr_create(tdata->pool);
+        via->sent_by.host = pj_str(pj_inet_ntoa(send_addr->ipv4.sin_addr));
+        via->sent_by.port = (int)send_addr->ipv4.sin_port;
+        pjsip_msg_add_hdr(tdata->msg, (pjsip_hdr*) via);
+
+        char local_uri[128];
+        snprintf(local_uri, 128, "sip:sbc@%s", pj_inet_ntoa(rdata->tp_info.transport->local_addr.ipv4.sin_addr));
+        pjsip_contact_hdr* contact = (pjsip_contact_hdr*) pjsip_msg_find_hdr(tdata->msg, PJSIP_H_CONTACT, NULL);
+        if (contact)
+        {
+            contact->uri = pjsip_parse_uri(tdata->pool, local_uri, pj_ansi_strlen(local_uri), PJSIP_PARSE_URI_AS_NAMEADDR);
+        }
+
+        pjsip_cseq_hdr* cseq = pjsip_msg_find_hdr(tdata->msg, PJSIP_H_CSEQ, NULL);
+        if (cseq)
+        {
+            cseq->cseq = uas_inv->dlg->local.first_cseq;
+        }
+
+        pjsip_response_addr resp_addr;
+        resp_addr.addr = *send_addr;
+        resp_addr.addr_len = sizeof(pj_in_addr);
+        resp_addr.transport = send_transport;
+        resp_addr.dst_host.addr.host = pj_str(pj_inet_ntoa(send_addr->ipv4.sin_addr));
+        resp_addr.dst_host.addr.port = (int)send_addr->ipv4.sin_port;
+        resp_addr.dst_host.type = PJSIP_TRANSPORT_UDP;
+        resp_addr.dst_host.flag = send_transport->flag;
+
+        PJ_LOG(5,(__FILE__, "== SENDING RESPONSE %ld bytes %s to %s %s:%d ==\n"
+                         "%.*s\n"
+                         "== end of msg ==",
+                         (tdata->buf.cur - tdata->buf.start),
+                         pjsip_tx_data_get_info(tdata),
+                         tdata->tp_info.transport->type_name,
+                         tdata->tp_info.dst_name,
+                         tdata->tp_info.dst_port,
+                         (int)(tdata->buf.cur - tdata->buf.start),
+                         tdata->buf.start));
+
+        pjsip_inv_send_msg(uas_inv, tdata);
+
+        return PJ_TRUE;
+    }
+    
+    return PJ_FALSE;
 }
 
 // static void rtp_callback(void* user_data, void* pkt, pj_ssize_t size)
