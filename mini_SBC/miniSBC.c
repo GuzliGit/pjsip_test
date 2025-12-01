@@ -7,27 +7,38 @@
 
 static pjsip_endpoint* sbc_endpt;
 static pjmedia_endpt* med_endpt;
-static pjmedia_sdp_session* local_sdp_in;
-static pjmedia_sdp_session* local_sdp_out;
+static pjmedia_conf* conf_bridge;
+static pjmedia_event_mgr* event_mgr;
 
 static pj_caching_pool ch_pool;
+static pj_pool_t* main_pool;
 static pj_pool_t* sdp_pool;
 
 static pjsip_transport* in_transport;
 static pjmedia_transport* in_med_transport;
 static pjmedia_transport_info in_med_tpinfo;
 static pjmedia_sock_info in_med_sockinfo;
+
+static pjmedia_stream* in_stream;
+static pjmedia_port* in_stream_port;
+static unsigned int in_slot;
+
 static pjsip_inv_session* uas_inv = NULL;
+static pjmedia_sdp_session* local_sdp_in;
 static pjmedia_sdp_session* remote_sdp_in;
-static pj_uint32_t cseq_in = 0;
 
 static pjsip_transport* out_transport;
 static pjmedia_transport* out_med_transport;
 static pjmedia_transport_info out_med_tpinfo;
 static pjmedia_sock_info out_med_sockinfo;
+
+static pjmedia_stream* out_stream;
+static pjmedia_port* out_stream_port;
+static unsigned int out_slot;
+
 static pjsip_inv_session* uac_inv = NULL;
+static pjmedia_sdp_session* local_sdp_out;
 static pjmedia_sdp_session* remote_sdp_out;
-static pj_uint32_t cseq_out = 0;
 
 static pj_sockaddr* in_addr;
 static pj_sockaddr* out_addr;
@@ -37,8 +48,10 @@ static volatile char is_end = 0;
 
 
 static pj_status_t create_endpoint();
-static pj_status_t create_transport();
 static pj_status_t create_pools();
+static pj_status_t create_med_endpoit();
+static pj_status_t create_transport();
+static pj_status_t init_conf();
 static pj_status_t init_modules();
 static void create_sbc_module();
 static pj_status_t create_registrator();
@@ -51,11 +64,21 @@ static pj_status_t initialize_media_bridge();
 static void call_on_state_changed(pjsip_inv_session*, pjsip_event*);
 static pj_bool_t on_rx_request(pjsip_rx_data*);
 static pj_bool_t on_rx_response(pjsip_rx_data*);
-static void rtp_callback(void*, void*, pj_ssize_t);
-static void rtcp_callback(void*, void*, pj_ssize_t);
 
 void cleanup()
 {
+    if (in_stream)
+    {
+        pjmedia_stream_destroy(in_stream);
+    }
+    if (out_stream)
+    {
+        pjmedia_stream_destroy(out_stream);
+    }
+    if (conf_bridge)
+    {
+        pjmedia_conf_destroy(conf_bridge);
+    }
     if (in_transport)
     {
         pjsip_transport_shutdown(in_transport);
@@ -75,6 +98,10 @@ void cleanup()
 
     registrator_destroy();
     
+    if (event_mgr)
+    {
+        pjmedia_event_mgr_destroy(event_mgr);
+    }
     if (med_endpt)
     {
         pjmedia_endpt_destroy(med_endpt);
@@ -82,6 +109,14 @@ void cleanup()
     if (sbc_endpt)
     {
         pjsip_endpt_destroy(sbc_endpt);
+    }
+    if (main_pool)
+    {
+        pj_pool_release(main_pool);
+    }
+    if (sdp_pool)
+    {
+        pj_pool_release(sdp_pool);
     }
     if (&ch_pool)
     {
@@ -115,12 +150,22 @@ int start_sbc(pj_sockaddr* inner_addr, pj_sockaddr* outer_addr)
         PJ_LOG(2, (__FILE__, "create_endpoint error"));
         goto _exit;
     }
+    status = create_pools();
+    if (status != PJ_SUCCESS)
+    {
+        goto _exit;
+    }
+    status = create_med_endpoit();
+    if (status != PJ_SUCCESS)
+    {
+        goto _exit;
+    }
     status = create_transport(in_addr, out_addr);
     if (status != PJ_SUCCESS)
     {
         goto _exit;
     }
-    status = create_pools();
+    status = init_conf();
     if (status != PJ_SUCCESS)
     {
         goto _exit;
@@ -160,11 +205,29 @@ static pj_status_t create_endpoint()
     }
     
     status = pjsip_endpt_create(&ch_pool.factory, ENDPOINT_NAME, &sbc_endpt);
-    if (status != PJ_SUCCESS)
+    return status;
+}
+
+static pj_status_t create_pools()
+{
+    main_pool = pj_pool_create(&ch_pool.factory, "main_pool", MAIN_POOL_SIZE, MAIN_POOL_SIZE, NULL);
+    if (!main_pool)
     {
-        return status;
+        return -1;
     }
 
+    sdp_pool = pj_pool_create(&ch_pool.factory, "sdp_pool", SDP_POOL_SIZE, SDP_POOL_SIZE, NULL);
+    if (!sdp_pool)
+    {
+        return -1;
+    }
+
+    return PJ_SUCCESS;
+}
+
+static pj_status_t create_med_endpoit()
+{
+    pj_status_t status;
     pj_ioqueue_t* ioqueue = pjsip_endpt_get_ioqueue(sbc_endpt);
     if (ioqueue)
     {
@@ -179,6 +242,13 @@ static pj_status_t create_endpoint()
     {
         return status;
     }
+
+    status = pjmedia_event_mgr_create(main_pool, 0, &event_mgr);
+    if (status != PJ_SUCCESS)
+    {
+        return status;
+    }    
+    pjmedia_event_mgr_set_instance(event_mgr);
 
     status = pjmedia_codec_g711_init(med_endpt);
     return status;
@@ -201,7 +271,8 @@ static pj_status_t create_transport()
         return status;
     }
 
-    status = pjmedia_transport_udp_create(med_endpt, "Inner media transport", RTP_PORT_IN, 0, &in_med_transport);
+    pj_str_t inner_addr = pj_str(pj_inet_ntoa(in_addr->ipv4.sin_addr));
+    status = pjmedia_transport_udp_create2(med_endpt, "Inner media transport", &inner_addr, RTP_PORT_IN, 0, &in_med_transport);
     if (status != PJ_SUCCESS)
     {
         PJ_LOG(2, (__FILE__, "create inner media transport error"));
@@ -217,7 +288,8 @@ static pj_status_t create_transport()
     }
     pj_memcpy(&in_med_sockinfo, &in_med_tpinfo.sock_info, sizeof(pjmedia_sock_info));
 
-    status = pjmedia_transport_udp_create(med_endpt, "Outer media transport", RTP_PORT_OUT, 0, &out_med_transport);
+    pj_str_t outer_addr = pj_str(pj_inet_ntoa(out_addr->ipv4.sin_addr));
+    status = pjmedia_transport_udp_create2(med_endpt, "Outer media transport", &outer_addr, RTP_PORT_OUT, 0, &out_med_transport);
     if (status != PJ_SUCCESS)
     {
         PJ_LOG(2, (__FILE__, "create outer media transport error"));
@@ -235,15 +307,12 @@ static pj_status_t create_transport()
     return status;
 }
 
-static pj_status_t create_pools()
+static pj_status_t init_conf()
 {
-    sdp_pool = pj_pool_create(&ch_pool.factory, "sdp_pool", SDP_POOL_SIZE, SDP_POOL_SIZE, NULL);
-    if (!sdp_pool)
-    {
-        return -1;
-    }
+    pj_status_t status;
 
-    return PJ_SUCCESS;
+    status = pjmedia_conf_create(main_pool, MAX_SLOTS, 8000, 1, 160, 16, PJMEDIA_CONF_NO_DEVICE, &conf_bridge);
+    return status;
 }
 
 static pj_status_t init_modules()
@@ -358,7 +427,7 @@ static pj_status_t start_uas_dlg(pjsip_rx_data* rdata)
     }
 
     pjmedia_sock_info* cur_sock_info = (rdata->tp_info.transport == in_transport) ? &in_med_sockinfo : &out_med_sockinfo;
-    status = pjmedia_endpt_create_sdp(med_endpt, sdp_pool, 1, cur_sock_info, &local_sdp_in); //pool!
+    status = pjmedia_endpt_create_sdp(med_endpt, sdp_pool, 1, cur_sock_info, &local_sdp_in);
     if (status != PJ_SUCCESS)
     {
         pjsip_dlg_dec_lock(uas_dlg);
@@ -394,7 +463,7 @@ static pj_status_t start_uac_dlg(pjsip_rx_data* rdata, pjsip_tx_data* tdata)
     }
 
     pjmedia_sock_info* cur_sock_info = (rdata->tp_info.transport == in_transport) ? &out_med_sockinfo : &in_med_sockinfo;
-    pj_status_t status = pjmedia_endpt_create_sdp(med_endpt, sdp_pool, 1, cur_sock_info, &local_sdp_out); //pool!
+    pj_status_t status = pjmedia_endpt_create_sdp(med_endpt, sdp_pool, 1, cur_sock_info, &local_sdp_out);
     if (status != PJ_SUCCESS)
     {
         return -3;
@@ -437,22 +506,80 @@ static pj_status_t start_uac_dlg(pjsip_rx_data* rdata, pjsip_tx_data* tdata)
 static pj_status_t initialize_media_bridge()
 {
     pj_status_t status;
-    pj_sockaddr rem_out_addr, rem_in_addr;
-    pj_sockaddr_parse(PJ_AF_INET, 0, &remote_sdp_out->conn->addr, &rem_out_addr);
-    pj_sockaddr_parse(PJ_AF_INET, 0, &remote_sdp_in->conn->addr, &rem_in_addr);
+    pjmedia_stream_info info;
+    const pjmedia_codec_info* codec_info = pj_pool_zalloc(sdp_pool, sizeof(pjmedia_codec_info));
+    pjmedia_codec_mgr_get_codec_info(pjmedia_endpt_get_codec_mgr(med_endpt), 0, &codec_info);
 
-    status = pjmedia_transport_attach(in_med_transport, (void*) out_med_transport, &rem_out_addr, 
-                                      NULL, sizeof(pj_sockaddr_in), rtp_callback, rtcp_callback);
-    status = pjmedia_transport_attach(out_med_transport, (void*) in_med_transport, &rem_in_addr, 
-                                      NULL, sizeof(pj_sockaddr_in), rtp_callback, rtcp_callback);
+    info.type = PJMEDIA_TYPE_AUDIO;
+    info.dir = PJMEDIA_DIR_ENCODING_DECODING;
+    pj_memcpy(&info.fmt, codec_info, sizeof(pjmedia_codec_info));
+    info.fmt.pt = codec_info->pt;
+    info.ssrc = pj_rand();
+    pj_memcpy(&info.rem_addr, in_addr, sizeof(pj_sockaddr_in));
 
-    status = pjmedia_transport_media_start(in_med_transport, uas_inv->pool, local_sdp_in, remote_sdp_in, 0);
+    status = pjmedia_stream_create(med_endpt, main_pool, &info, in_med_transport, NULL, &in_stream);
+    if (status != PJ_SUCCESS)
+    {
+        return status;
+    }
+    pj_memcpy(&info.rem_addr, out_addr, sizeof(pj_sockaddr_in));
+    status = pjmedia_stream_create(med_endpt, main_pool, &info, out_med_transport, NULL, &out_stream);
     if (status != PJ_SUCCESS)
     {
         return status;
     }
 
-    status = pjmedia_transport_media_start(out_med_transport, uac_inv->pool, local_sdp_out, remote_sdp_out, 0);
+    status = pjmedia_stream_get_port(in_stream, &in_stream_port);
+    if (status != PJ_SUCCESS)
+    {
+        return status;
+    }
+    status = pjmedia_stream_get_port(out_stream, &out_stream_port);
+    if (status != PJ_SUCCESS)
+    {
+        return status;
+    }
+
+    status = pjmedia_conf_add_port(conf_bridge, main_pool, in_stream_port, NULL, &in_slot);
+    if (status != PJ_SUCCESS)
+    {
+        return status;
+    }
+    status = pjmedia_conf_add_port(conf_bridge, main_pool, out_stream_port, NULL, &out_slot);
+    if (status != PJ_SUCCESS)
+    {
+        return status;
+    }
+
+    status = pjmedia_conf_connect_port(conf_bridge, in_slot, out_slot, 0);
+    if (status != PJ_SUCCESS)
+    {
+        return status;
+    }
+    status = pjmedia_conf_connect_port(conf_bridge, out_slot, in_slot, 0);
+    if (status != PJ_SUCCESS)
+    {
+        return status;
+    }
+
+    status = pjmedia_transport_media_start(in_med_transport, sdp_pool, local_sdp_in, remote_sdp_in, 0);
+    if (status != PJ_SUCCESS)
+    {
+        return status;
+    }
+    status = pjmedia_transport_media_start(out_med_transport, sdp_pool, local_sdp_out, remote_sdp_out, 0);
+    if (status != PJ_SUCCESS)
+    {
+        return status;
+    }
+
+    status = pjmedia_stream_start(in_stream);
+    if (status != PJ_SUCCESS)
+    {
+        return status;
+    }
+
+    status = pjmedia_stream_start(out_stream);
     return status;
 }
 
@@ -464,11 +591,23 @@ static void call_on_state_changed(pjsip_inv_session* inv, pjsip_event* e)
     if (inv->state == PJSIP_INV_STATE_DISCONNECTED)
     {
         PJ_LOG(2, (__FILE__, "Call disconnected | reason=%d [%.*s]", inv->cause, (int)inv->cause_text.slen, inv->cause_text.ptr));
+        if (uas_inv && uac_inv && uac_inv->state == PJSIP_INV_STATE_DISCONNECTED && uas_inv->state == PJSIP_INV_STATE_DISCONNECTED)
+        {
+            pj_pool_release(sdp_pool);
+        }
     }
     else if (uas_inv && uac_inv && uas_inv->state == PJSIP_INV_STATE_CONFIRMED && uac_inv->state == PJSIP_INV_STATE_CONFIRMED)
     {
         PJ_LOG(2, (__FILE__, "===== Connection established | media bridge initializing ====="));
-        initialize_media_bridge();
+        pj_status_t status = initialize_media_bridge();
+        if (status != PJ_SUCCESS)
+        {
+            PJ_LOG(2, (__FILE__, "===== Media bridge initialization error ====="));
+        }
+        else
+        {
+            PJ_LOG(2, (__FILE__, "===== Media bridge was successfully initialized ====="));
+        }
     }
     else
     {
@@ -540,12 +679,11 @@ static pj_bool_t on_rx_request(pjsip_rx_data* rdata)
         return PJ_FALSE;
     }
 
-    remote_sdp_in = pjsip_get_sdp_info(uas_inv->pool, rdata->msg_info.msg->body, NULL, NULL)->sdp;
+    remote_sdp_in = pjsip_get_sdp_info(sdp_pool, rdata->msg_info.msg->body, NULL, NULL)->sdp;
     if (!remote_sdp_in)
     {
         goto clean_uas;
     }
-    cseq_in = rdata->msg_info.cseq->cseq;
 
     pjsip_tx_data* tdata;
     status = pjsip_inv_initial_answer(uas_inv, rdata, 100, NULL, NULL, &tdata);
@@ -609,41 +747,26 @@ static pj_bool_t on_rx_response(pjsip_rx_data* rdata)
         pjsip_tx_data* tdata;
         pjsip_inv_session* answer_sess = (pjsip_rdata_get_dlg(rdata) == uas_inv->dlg) ? uac_inv : uas_inv;
         pjmedia_sdp_session* cur_sdp_sess; 
-        cur_sdp_sess = pjsip_get_sdp_info(sdp_pool, rdata->msg_info.msg->body, NULL, NULL)->sdp; ////pool!!!!
+        cur_sdp_sess = pjsip_get_sdp_info(sdp_pool, rdata->msg_info.msg->body, NULL, NULL)->sdp;
         if (cur_sdp_sess)
         {
             if (answer_sess == uas_inv)
             {
                 remote_sdp_out = cur_sdp_sess;
-                pjsip_inv_set_sdp_answer(answer_sess, local_sdp_out);
+                pjsip_inv_set_sdp_answer(answer_sess, local_sdp_in);
             }
             else
             {
                 remote_sdp_in = cur_sdp_sess;
-                pjsip_inv_set_sdp_answer(answer_sess, local_sdp_in);
+                pjsip_inv_set_sdp_answer(answer_sess, local_sdp_out);
             }
         }
         
         status = pjsip_inv_answer(answer_sess, rdata->msg_info.msg->line.status.code, NULL, NULL, &tdata);
         status = pjsip_inv_send_msg(answer_sess, tdata);
 
-        if (uac_inv && cseq_out == 0)
-        {
-            cseq_out = rdata->msg_info.cseq->cseq;
-        }
-
         return PJ_FALSE;
     }
     
     return PJ_FALSE;
-}
-
-static void rtp_callback(void* user_data, void* pkt, pj_ssize_t size)
-{
-    pjmedia_transport_send_rtp((pjmedia_transport*)user_data, pkt, size);
-}
-
-static void rtcp_callback(void* user_data, void* pkt, pj_ssize_t size)
-{
-    pjmedia_transport_send_rtcp((pjmedia_transport*)user_data, pkt, size);
 }
