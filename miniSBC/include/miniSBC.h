@@ -4,7 +4,7 @@
 #include <pjlib.h>
 
 #define MAIN_POOL_SIZE 512
-#define SDP_POOL_SIZE 512
+#define STREAM_POOL_SIZE 512
 
 #define MAX_ADDR_LEN 32
 #define MAX_SLOTS 8

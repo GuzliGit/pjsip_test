@@ -3,8 +3,9 @@ CC_ARM64 = aarch64-linux-gnu-gcc
 
 BIN_DIR = bin
 OBJ_DIR = objs
+SRC_DIR = src
 
-CFLAGS = $(shell pkg-config --cflags --libs libpjproject) -fsanitize=address
+CFLAGS = $(shell pkg-config --cflags --libs libpjproject) -fsanitize=address -Iinclude
 
 TARGET_x86_64 = $(BIN_DIR)/miniSBC
 TARGET_ARM64 = $(BIN_DIR)/miniSBC-arm
@@ -21,7 +22,7 @@ $(TARGET_x86_64): $(OBJS_x86_64)
 	mkdir -p $(BIN_DIR)
 	$(CC_x86_64) $^ -g -o $@ $(CFLAGS)
 
-$(OBJ_DIR)/%-x86_64.o: %.c
+$(OBJ_DIR)/%-x86_64.o: $(SRC_DIR)/%.c
 	mkdir -p $(OBJ_DIR)
 	$(CC_x86_64) -c $< -g -o $@ $(CFLAGS)
 
@@ -31,7 +32,7 @@ $(TARGET_ARM64): $(OBJS_ARM64)
 	mkdir -p $(BIN_DIR)
 	$(CC_ARM64) $^ -g -o $@ $(CFLAGS)
 
-$(OBJ_DIR)/%-arm64.o: %.c
+$(OBJ_DIR)/%-arm64.o: $(SRC_DIR)/%.c
 	mkdir -p $(OBJ_DIR)
 	$(CC_ARM64) -c $< -g -o $@ $(CFLAGS)
 
